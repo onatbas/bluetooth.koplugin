@@ -1,0 +1,7 @@
+menu_item :main    :Bluetooth Patch (toggle) :cmd_output         :500:quiet :rmmod -w /mnt/onboard/.adds/kobo-libra2-uhid-module/uhid.ko
+  chain_success:skip:3
+  chain_failure                              :cmd_spawn          :quiet :exec /mnt/onboard/.adds/kobo-libra2-uhid-module/run.sh
+  chain_success                              :dbg_toast          :insmod uhid.ko successfully
+  chain_always:skip:-1
+  chain_success                              :dbg_toast          :rmmod -w uhid.ko successfully
+
