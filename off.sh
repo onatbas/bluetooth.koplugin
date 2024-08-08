@@ -1,11 +1,10 @@
 #!/bin/bash
+cd "$(dirname "$0")"
 
-# Check if bluetoothd is running
-if pgrep bluetoothd > /dev/null
-then
-    echo "bluetoothd is running. Turning off Bluetooth and killing bluetoothd."
-    bluetoothctl power off
-    pkill bluetoothd
-else
-    echo "bluetoothd is not running. No action taken."
-fi
+hciconfig hci0 down
+pkill hciattach
+pkill bluetoothd
+rmmod -w /drivers/mx6sll-ntx/wifi/sdio_bt_pwr.ko
+rmmod -w  ./uhid/uhid.ko
+
+

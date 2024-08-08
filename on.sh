@@ -1,12 +1,8 @@
 #!/bin/bash
+cd "$(dirname "$0")"
 
-# Check if bluetoothd is running
-if ! pgrep bluetoothd > /dev/null
-then
-    echo "bluetoothd is not running. Starting bluetoothd and turning on Bluetooth."
-    /libexec/bluetooth/bluetoothd  > /dev/null 2>&1 &
-    timeout 2s bluetoothctl power on
-else
-    echo "bluetoothd is already running. No action taken."
-fi
-
+insmod /drivers/mx6sll-ntx/wifi/sdio_bt_pwr.ko
+insmod ./uhid/uhid.ko
+/sbin/hciattach -p ttymxc1 any 1500000 flow -t 20
+dbus-send --system --dest=org.bluez --print-reply  /  org.freedesktop.DBus.ObjectManager.GetManagedObjects
+hciconfig hci0 up
