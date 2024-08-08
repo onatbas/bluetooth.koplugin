@@ -1,0 +1,6 @@
+hci0:	Type: Primary  Bus: UART
+	BD Address: A4:3C:D7:10:62:44  ACL MTU: 1016:5  SCO MTU: 60:12
+	DOWN 
+	RX bytes:1526 acl:0 sco:0 events:96 errors:0
+	TX bytes:2595 acl:0 sco:0 commands:96 errors:0
+
