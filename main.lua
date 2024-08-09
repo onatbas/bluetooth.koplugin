@@ -8,10 +8,12 @@ local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local NetworkMgr = require("ui/network/manager")
+
 local _ = require("gettext")
 
 local Bluetooth = WidgetContainer:extend{
-    name = "bluetooth",
+    name = "Bluetooth",
     is_doc_only = false,
 }
 
@@ -33,19 +35,18 @@ function Bluetooth:addToMainMenu(menu_items)
             {
                 text = _("Bluetooth on"),
                 callback = function()
-                    self:onBluetoothOn()
+                    NetworkMgr:turnOnWifi(function()
+				self:onBluetoothOn()
+				    local status, err = pcall(function()
+				       require("device/kobo/device").input.open("/dev/input/event3")
+				    end)                            
+				end)
                 end,
             },
             {
                 text = _("Bluetooth off"),
-                callback = function()
+                callback = function()     
                     self:onBluetoothOff()
-                end,
-            },
-            {
-                text = _("Kernel Patch"),
-                callback = function()
-                    self:onBluetoothPatch()
                 end,
             },
         },
@@ -75,15 +76,6 @@ end
 
 function Bluetooth:onBluetoothOff()
     local script = self:getScriptPath("off.sh")
-    local result = self:executeScript(script)
-    local popup = InfoMessage:new{
-        text = _("Result: ") .. result,
-    }
-    UIManager:show(popup)
-end
-
-function Bluetooth:onBluetoothPatch()
-    local script = self:getScriptPath("uhid.sh")
     local result = self:executeScript(script)
     local popup = InfoMessage:new{
         text = _("Result: ") .. result,
