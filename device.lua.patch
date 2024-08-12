@@ -1,0 +1,32 @@
+--- koreader/frontend/device/kobo/device.lua	2024-07-15 12:02:02.000000000 -0400
++++ koreader/frontend/device/kobo/device.lua	2024-08-11 17:54:44.000000000 -0400
+@@ -489,6 +489,7 @@
+     hasEclipseWfm = yes,
+     canToggleChargingLED = yes,
+     led_uses_channel_3 = true,
++    hasKeys = yes,
+     hasFrontlight = yes,
+     display_dpi = 300,
+     hasNaturalLight = yes,
+@@ -828,6 +829,7 @@
+             [102] = "Home",
+             [116] = "Power",
+             [193] = "RPgBack",
++            [115] = "RPgFwd",
+             [194] = "RPgFwd",
+             [331] = "Eraser",
+             [332] = "Highlighter",
+@@ -901,6 +903,13 @@
+     -- NOTE: usb hotplug event is also available in /tmp/nickel-hardware-status (... but only when Nickel is running ;p)
+     self.input.open("fake_events")
+ 
++    local success, err = pcall(function()
++        self.input.open("/dev/input/event3")
++    end)
++
++
++
++
+     -- See if the device supports key repeat
+     -- This is *not* behind a hasKeys check, because we mainly use it to stop SleepCover chatter,
+     -- and sleep covers are available on a number of devices without keys ;).

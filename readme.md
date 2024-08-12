@@ -20,8 +20,11 @@ The plugin will also add uhid.ko kernel patch which is a requirement for certain
 1. Copy this folder into koreader/plugins
 2. Make sure your clicker is already paired with the kobo device.
 3. Make sure that your device is mapped to /dev/input/event3 (this is not always guaranteed). If different, edit main.lua of this plugin to match the correct input device. (TODO: Automate)
+4. Add hasKeys = yes to the device configuration. (TODO: Automate)
 4. Add into "koreader/frontend/device/kobo/device.lua" the device event that your bluetooth device triggers for the buttons on it. See an example here: https://github.com/koreader/koreader/issues/9059#issuecomment-1464958230 . For my device, I needed to add  '[115] = "RPgFwd",' into the event map. (TODO: Automate)
 4. Reboot KOReader
+
+The device.lua changes are documented in devica.lua.patch
 
 
 ## Contributions
