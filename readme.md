@@ -27,10 +27,25 @@ The plugin will also add uhid.ko kernel patch which is a requirement for certain
 The device.lua changes are documented in devica.lua.patch
 
 
+**Device Specific Modifications:**
+
+### Clara 2E
+By default, all instructions are given for Clara 2E. No further modifications are needed apart from those documented in this description.
+
+### Libra 2
+MobileRead user **enji** provided instructions to adapt this plugin to Libra 2 by using `rtk_hciattach` instead of `hciattach`. *Thanks enji!*
+
+Replace `hciattach` with `rtk_hciattach` instructions:
+- In *bluetooth.koplugin/on.sh*, change `hciattach -p ttymxc1 any 1500000 flow -t 20` to `/sbin/rtk_hciattach -s 115200 ttymxc1 rtk_h5`.
+- In *bluetooth.koplugin/off.sh*, change `pkill hciattach` to `pkill rtk_hciattach`.
+
+
 ## Contributions
 
 I have tested this only on a Clara 2E, all contributions are welcome. Here are some reading materials on this topic:
+
 https://www.mobileread.com/forums/showthread.php?p=4444741#post4444741
+
 https://github.com/koreader/koreader/issues/9059
 
-
+MobileRead user **enji**'s comment on Libra 2: https://www.mobileread.com/forums/showpost.php?p=4447639&postcount=16
