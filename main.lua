@@ -9,7 +9,6 @@ local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local NetworkMgr = require("ui/network/manager")
 local Device = require("device")
 local EventListener = require("ui/widget/eventlistener")
 local Event = require("ui/event")  -- Add this line
@@ -54,11 +53,11 @@ function Bluetooth:onBTGotoPrevChapter()
 end
 
 function Bluetooth:onBTDecreaseFontSize()
-    UIManager:sendEvent(Event:new("DecreaseFontSize", 1))
+    UIManager:sendEvent(Event:new("DecreaseFontSize", 2))
 end
 
 function Bluetooth:onBTIncreaseFontSize()
-    UIManager:sendEvent(Event:new("IncreaseFontSize", 1))
+    UIManager:sendEvent(Event:new("IncreaseFontSize", 2))
 end
 
 function Bluetooth:onBTToggleBookmark()
@@ -96,7 +95,7 @@ function Bluetooth:addToMainMenu(menu_items)
             {
                 text = _("Bluetooth on"),
                 callback = function()
-                    if not NetworkMgr:getWifiStatus() then
+                    if not self:isWifiEnabled() then
                         self:popup("Please turn on Wi-Fi to continue.")
                     else
                         self:onBluetoothOn()
@@ -165,11 +164,6 @@ function Bluetooth:onBluetoothOff()
     local script = self:getScriptPath("off.sh")
     local result = self:executeScript(script)
 
-    if not result or result == "" then
-        self:popup(_("Error: No result from the Bluetooth script"))
-        return
-    end
-
     self.is_bluetooth_on = false
     self:popup(_("Bluetooth turned off."))
 end
@@ -227,5 +221,15 @@ function Bluetooth:popup(text)
     }
     UIManager:show(popup)
 end
+
+function Bluetooth:isWifiEnabled()
+    local handle = io.popen("iwconfig")
+    local result = handle:read("*a")
+    handle:close()
+
+    -- Check if Wi-Fi is enabled by looking for 'ESSID'
+    return result:match("ESSID") ~= nil
+end
+
 
 return Bluetooth
