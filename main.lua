@@ -204,8 +204,18 @@ function Bluetooth:onConnectToDevice()
 
     local script = self:getScriptPath("connect.sh")
     local result = self:executeScript(script)
-    self:popup(_("Result: ") .. result)
+
+    -- Simplify the message: focus on the success and device name
+    local device_name = result:match("Name:%s*(.-)\n")  -- Extract the device name
+    local success = result:match("Connection successful")  -- Check if connection was successful
+
+    if success and device_name then
+        self:popup(_("Connection successful: ") .. device_name)
+    else
+        self:popup(_("Result: ") .. result)  -- Show full result for debugging if something goes wrong
+    end
 end
+
 
 function Bluetooth:debugPopup(msg)
     self:popup(_("DEBUG: ") .. msg)
