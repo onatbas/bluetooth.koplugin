@@ -45,6 +45,15 @@ The following new Bluetooth events have been implemented, allowing for additiona
 - **BTBluetoothOff:** Turn off Bluetooth.
 - **BTRight:** Go to the next page.
 - **BTLeft:** Go to the previous page.
+- **BTPrevBookmark:** Navigate to the previous bookmark in the document.
+- **BTNextBookmark:** Navigate to the next bookmark in the document.
+- **BTLastBookmark:** Jump to the last bookmark by timestamp.
+- **BTToggleStatusBar:** Toggle the display of the status bar.
+- **BTIncreaseBrightness:** Increase the frontlight brightness by 10 units.
+- **BTDecreaseBrightness:** Decrease the frontlight brightness by 10 units.
+- **BTToggleNightMode:** Toggle between dark mode (night mode) and light mode.
+- **BTIncreaseWarmth:** Increase the warmth of the frontlight by 2 units.
+- **BTDecreaseWarmth:** Decrease the warmth of the frontlight by 2 units.
 
 *BTRight and BTLeft are recommended for page turning instead of the default actions, as these custom events will work with all screen orientations.*
 
@@ -66,16 +75,26 @@ Below is an example of how you can map Bluetooth device events in your `device.l
 event_map = {
     -- Your existing mappings...
     
-    -- Bluetooth device mappings for an 8bitdo. You can add as many codes as you want.
-    [46]  = "BTGotoNextChapter",   -- C for Next Chapter
-    [45]  = "BTGotoPrevChapter",   -- X for Previous Chapter
-    [32]  = "BTDecreaseFontSize",  -- D for Decrease Font Size
-    [23]  = "BTIncreaseFontSize",  -- I for Increase Font Size
-    [48]  = "BTToggleBookmark",    -- B for Toggle Bookmark 
-    [25]  = "BTLeft",              -- P for Previous Page   
-    [49]  = "BTRight",             -- N for Next Page       
-    [19]  = "BTIterateRotation",   -- R for Rotate 90 Degrees
-    [109] = "BTBluetoothOff",      -- Page Down for Bluetooth Off
+   [46]  = "BTGotoNextChapter",  -- C for Next Chapter                           
+    [45]  = "BTGotoPrevChapter",  -- X for Previous Chapter                       
+    [32]  = "BTDecreaseFontSize", -- D for Decrease Font Size                     
+    [23]  = "BTIncreaseFontSize", -- I for Increase Font Size
+    [48]  = "BTToggleBookmark",   -- B for Toggle Bookmark   
+    [25]  = "BTLeft",             -- P for Previous Page                
+    [49]  = "BTRight",            -- N for Next Page         
+    [19]  = "BTIterateRotation",  -- R for Rotate 90 Degrees 
+    [109] = "BTBluetoothOff",     -- Page Down for Bluetooth Off
+                                                                
+    [105] = "BTPrevBookmark",    -- Left arrow key for Previous Bookmark
+    [106] = "BTNextBookmark",    -- Right arrow key for Next Bookmark   
+    [108] = "BTLastBookmark",    -- Down arrow key for Last Bookmark (by timestamp)
+    [103] = "BTToggleStatusBar", -- Up arrow key for Toggle Status Bar             
+    [60]  = "BTIncreaseBrightness",   -- F2 for Increase Brightness                
+    [59]  = "BTDecreaseBrightness",   -- F1 for Decrease Brightness                
+    [38]  = "BTToggleNightMode",     -- L for Toggle Night Mode (Dark/Light Mode)  
+
+--    [49]  = "BTIncreaseWarmth",       -- N for Increase Warmth                   
+--    [48]  = "BTDecreaseWarmth",       -- C for Decrease Warmth                   
 }
 ```
 

@@ -41,6 +41,16 @@ function Bluetooth:registerKeyEvents()
     self.key_events.BTBluetoothOff = { { "BTBluetoothOff" }, event = "BTBluetoothOff" }
     self.key_events.BTRight = { { "BTRight" }, event = "BTRight" }
     self.key_events.BTLeft = { { "BTLeft" }, event = "BTLeft" }
+	self.key_events.BTIncreaseBrightness = { { "BTIncreaseBrightness" }, event = "BTIncreaseBrightness" }
+	self.key_events.BTDecreaseBrightness = { { "BTDecreaseBrightness" }, event = "BTDecreaseBrightness" }
+	self.key_events.BTIncreaseWarmth = { { "BTIncreaseWarmth" }, event = "BTIncreaseWarmth" }
+	self.key_events.BTDecreaseWarmth = { { "BTDecreaseWarmth" }, event = "BTDecreaseWarmth" }
+	self.key_events.BTNextBookmark = { { "BTNextBookmark" }, event = "BTNextBookmark" }
+	self.key_events.BTPrevBookmark = { { "BTPrevBookmark" }, event = "BTPrevBookmark" }
+	self.key_events.BTLastBookmark = { { "BTLastBookmark" }, event = "BTLastBookmark" }
+	self.key_events.BTToggleNightMode = { { "BTToggleNightMode" }, event = "BTToggleNightMode" }
+	self.key_events.BTToggleStatusBar = { { "BTToggleStatusBar" }, event = "BTToggleStatusBar" }
+	
 end
 
 
@@ -79,6 +89,43 @@ end
 function Bluetooth:onBTLeft()
     UIManager:sendEvent(Event:new("GotoViewRel", -1))
 end
+
+function Bluetooth:onBTIncreaseBrightness()
+    UIManager:sendEvent(Event:new("IncreaseFlIntensity", 10))
+end
+
+function Bluetooth:onBTDecreaseBrightness()
+    UIManager:sendEvent(Event:new("DecreaseFlIntensity", 10))
+end
+
+function Bluetooth:onBTIncreaseWarmth()
+    UIManager:sendEvent(Event:new("IncreaseFlWarmth", 1))
+end
+
+function Bluetooth:onBTDecreaseWarmth()
+    UIManager:sendEvent(Event:new("IncreaseFlWarmth", -1))
+end
+
+function Bluetooth:onBTNextBookmark()
+    UIManager:sendEvent(Event:new("GotoNextBookmarkFromPage"))
+end
+
+function Bluetooth:onBTPrevBookmark()
+    UIManager:sendEvent(Event:new("GotoPreviousBookmarkFromPage"))
+end
+
+function Bluetooth:onBTLastBookmark()
+    UIManager:sendEvent(Event:new("GoToLatestBookmark"))
+end
+
+function Bluetooth:onBTToggleNightMode()
+    UIManager:sendEvent(Event:new("ToggleNightMode"))
+end
+
+function Bluetooth:onBTToggleStatusBar()
+    UIManager:sendEvent(Event:new("ToggleFooterMode"))
+end
+
 
 function Bluetooth:init()
     self:onDispatcherRegisterActions()
@@ -156,11 +203,6 @@ function Bluetooth:onBluetoothOn()
 end
 
 function Bluetooth:onBluetoothOff()
-    if not self.is_bluetooth_on then
-        self:popup(_("Bluetooth is already off."))
-        return
-    end
-
     local script = self:getScriptPath("off.sh")
     local result = self:executeScript(script)
 
