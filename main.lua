@@ -21,9 +21,8 @@ local _ = require("gettext")
 -- local Bluetooth = EventListener:extend{
 local Bluetooth = InputContainer:extend{
     name = "Bluetooth",
-    is_doc_only = false,
-    is_running = false,  -- Internal variable to track if the task is running
-    task_interval = 4000, -- Interval in milliseconds (4 seconds)
+    is_bluetooth_on = false,  -- Tracks the state of Bluetooth
+    input_device_path = "/dev/input/event3",  -- Device path
 }
 
 function Bluetooth:onDispatcherRegisterActions()
@@ -89,32 +88,6 @@ function Bluetooth:init()
     self:registerKeyEvents()
 end
 
-function Bluetooth:startRepeatingTask()
-    -- Ensure the task is only started once
-    if self.is_running then return end
-
-    self.is_running = true
-
-    local function onTimeout()
-        if self.is_running then
-            local status, err = pcall(function()
-
-                Device.input.open("/dev/input/event3")
-            end)
-            UIManager:setTimeout(self.task_interval, onTimeout)
-        end
-    end
-
-    UIManager:setTimeout(self.task_interval, onTimeout)
-end
-
-
-function Bluetooth:stopRepeatingTask()
-    self.is_running = false
-end
-
-
-
 function Bluetooth:addToMainMenu(menu_items)
     menu_items.bluetooth = {
         text = _("Bluetooth"),
@@ -123,29 +96,31 @@ function Bluetooth:addToMainMenu(menu_items)
             {
                 text = _("Bluetooth on"),
                 callback = function()
-                    NetworkMgr:turnOnWifi(function()
-				self:onBluetoothOn()
-				end)
+                    if not NetworkMgr:getWifiStatus() then
+                        self:popup("Please turn on Wi-Fi to continue.")
+                    else
+                        self:onBluetoothOn()
+                    end
                 end,
             },
             {
                 text = _("Bluetooth off"),
-                callback = function()     
+                callback = function()
                     self:onBluetoothOff()
                 end,
             },
             {
                 text = _("Reconnect to Device"),
-                callback = function()     
+                callback = function()
                     self:onConnectToDevice()
                 end,
             },
-	    {
-		text = _("Refresh Device Input"), -- New menu item
-		callback = function()
-			self:onRefreshPairing()
-		end,
-	    },
+            {
+                text = _("Refresh Device Input"), -- New menu item
+                callback = function()
+                    self:onRefreshPairing()
+                end,
+            },
         },
     }
 end
@@ -165,55 +140,82 @@ end
 function Bluetooth:onBluetoothOn()
     local script = self:getScriptPath("on.sh")
     local result = self:executeScript(script)
-    local popup = InfoMessage:new{
-        text = _("Result: ") .. result,
-    }
-    UIManager:show(popup)
-    self:startRepeatingTask()
-end
 
-function Bluetooth:onBluetoothOff()
-    local script = self:getScriptPath("off.sh")
-    local result = self:executeScript(script)
-    local popup = InfoMessage:new{
-        text = _("Result: ") .. result,
-    }
-    UIManager:show(popup)
-    self:stopRepeatingTask()
+    if not result or result == "" then
+        self:popup(_("Error: No result from the Bluetooth script"))
+        self.is_bluetooth_on = false
+        return
+    end
 
-end
-
-function Bluetooth:onRefreshPairing()
-    local status, err = pcall(function()
-        Device.input.close("/dev/input/event3") -- Close the input
-        Device.input.open("/dev/input/event3")  -- Reopen the input
-    end)
-    if not status then
-        local errorMsg = InfoMessage:new{ text = _("Error: ") .. err }
-        UIManager:show(errorMsg)
+    if result:match("complete") then
+        self.is_bluetooth_on = true
+        self:popup(_("Bluetooth turned on."))
+    else
+        self:popup(_("Result: ") .. result)
+        self.is_bluetooth_on = false
     end
 end
 
+function Bluetooth:onBluetoothOff()
+    if not self.is_bluetooth_on then
+        self:popup(_("Bluetooth is already off."))
+        return
+    end
 
+    local script = self:getScriptPath("off.sh")
+    local result = self:executeScript(script)
+
+    if not result or result == "" then
+        self:popup(_("Error: No result from the Bluetooth script"))
+        return
+    end
+
+    self.is_bluetooth_on = false
+    self:popup(_("Bluetooth turned off."))
+end
+
+function Bluetooth:onRefreshPairing()
+    if not self.is_bluetooth_on then
+        self:popup(_("Bluetooth is off. Please turn it on before refreshing pairing."))
+        return
+    end
+
+    local status, err = pcall(function()
+        -- Ensure the device path is valid
+        if not self.input_device_path or self.input_device_path == "" then
+            error("Invalid device path")
+        end
+
+        Device.input.close(self.input_device_path) -- Close the input using the high-level parameter
+        Device.input.open(self.input_device_path)  -- Reopen the input using the high-level parameter
+        self:popup(_("Bluetooth device at ") .. self.input_device_path .. " is now open.")
+    end)
+
+    if not status then
+        self:popup(_("Error: ") .. err)
+    end
+end
 
 function Bluetooth:onConnectToDevice()
+    if not self.is_bluetooth_on then
+        self:popup(_("Bluetooth is off. Please turn it on before connecting to a device."))
+        return
+    end
+
     local script = self:getScriptPath("connect.sh")
     local result = self:executeScript(script)
-    local popup = InfoMessage:new{
-        text = _("Result: ") .. result,
-    }
-    UIManager:show(popup)
-    self:startRepeatingTask()
+    self:popup(_("Result: ") .. result)
 end
 
 function Bluetooth:debugPopup(msg)
-
-    local popup = InfoMessage:new{                                                                                                                            
-        text = _("DEBUG: ") .. msg,
-    }                                                                                                                                                         
-    UIManager:show(popup)  
-
+    self:popup(_("DEBUG: ") .. msg)
 end
 
+function Bluetooth:popup(text)
+    local popup = InfoMessage:new{
+        text = text,
+    }
+    UIManager:show(popup)
+end
 
 return Bluetooth
