@@ -4,6 +4,8 @@ This is a plugin to manage Bluetooth.
 @module koplugin.Bluetooth
 --]]--
 
+local ConfirmBox = require("ui/widget/confirmbox")
+local DataStorage = require("datastorage")
 local Dispatcher = require("dispatcher")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
@@ -11,7 +13,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local Device = require("device")
 local EventListener = require("ui/widget/eventlistener")
-local Event = require("ui/event")  -- Add this line
+local Event = require("ui/event")
 
 -- local BTKeyManager = require("BTKeyManager")
 
@@ -20,12 +22,394 @@ local _ = require("gettext")
 -- local Bluetooth = EventListener:extend{
 local Bluetooth = InputContainer:extend{
     name = "Bluetooth",
-    is_bluetooth_on = false,  -- Tracks the state of Bluetooth
-    input_device_path = "/dev/input/event4",  -- Device path
+    is_bluetooth_on = false,  -- Cache for isBluetoothOn() - do not set directly
+    input_device_path = nil,  -- Device path (set dynamically in init)
     current_bank = 1,  -- Current bank (1-based)
     banks = {},  -- Bank configurations
     bank_config_file = "bank_config.txt",  -- Bank configuration file
 }
+
+-- Input device paths per device model
+Bluetooth.device_input_paths = {
+    ["Kobo_goldfinch"] = "/dev/input/event3",  -- Clara 2E
+    ["Kobo_io"] = "/dev/input/event4",         -- Libra 2
+}
+Bluetooth.default_input_path = "/dev/input/event4"  -- Default fallback
+
+-- Bluetooth command configurations per device model
+-- Each config contains the commands needed to turn BT on/off
+Bluetooth.device_bt_configs = {
+    ["Kobo_goldfinch"] = {  -- Clara 2E
+        name = "Clara 2E",
+        hci_attach = "/sbin/hciattach -p ttymxc1 any 1500000 flow -t 20",
+        hci_kill = "pkill hciattach",
+    },
+    ["Kobo_io"] = {  -- Libra 2
+        name = "Libra 2",
+        hci_attach = "/sbin/rtk_hciattach -s 115200 ttymxc1 rtk_h5",
+        hci_kill = "pkill rtk_hciattach",
+    },
+}
+-- Default config (uses Clara 2E style as fallback)
+Bluetooth.default_bt_config = {
+    name = "Default",
+    hci_attach = "/sbin/hciattach -p ttymxc1 any 1500000 flow -t 20",
+    hci_kill = "pkill hciattach",
+}
+
+-- Binary-based detection: map binary names to config profiles
+-- Used when device model is unknown but we can detect which binaries exist
+Bluetooth.binary_to_config = {
+    ["rtk_hciattach"] = {  -- Libra 2 style (Realtek chip)
+        name = "Auto-detected (Realtek/Libra 2 style)",
+        hci_attach = "/sbin/rtk_hciattach -s 115200 ttymxc1 rtk_h5",
+        hci_kill = "pkill rtk_hciattach",
+        detection_method = "rtk_hciattach binary found in /sbin",
+    },
+    ["hciattach"] = {  -- Clara 2E style (standard)
+        name = "Auto-detected (Standard/Clara 2E style)",
+        hci_attach = "/sbin/hciattach -p ttymxc1 any 1500000 flow -t 20",
+        hci_kill = "pkill hciattach",
+        detection_method = "hciattach binary found in /sbin",
+    },
+}
+
+-- Default BTAction key mappings for 8BitDo controller
+-- These will be written to settings/event_map.lua if auto-correction is used
+Bluetooth.default_event_mappings = {
+    [19]  = "BTAction1",   -- R
+    [23]  = "BTAction2",   -- I
+    [25]  = "BTAction3",   -- P/Y
+    [32]  = "BTAction4",   -- D/R2
+    [38]  = "BTAction5",   -- L/L2
+    [45]  = "BTAction6",   -- X
+    [46]  = "BTAction7",   -- C/B
+    [48]  = "BTAction8",   -- B/UP
+    [49]  = "BTAction9",   -- N/A
+    [60]  = "BTAction15",  -- F2 (bank switch)
+    [61]  = "BTAction16",  -- F3 (bank switch)
+    [103] = "BTAction10",  -- Up arrow
+    [105] = "BTAction11",  -- Left arrow
+    [106] = "BTAction12",  -- Right arrow
+    [108] = "BTAction13",  -- Down arrow
+    [109] = "BTAction14",  -- Page Down
+    [115] = "BTLeft",      -- Additional button
+}
+
+-- Config file for storing Bluetooth device settings
+Bluetooth.config_file = "bt_config.lua"
+
+-- Button press history (for diagnostics)
+Bluetooth.button_press_history = {}
+Bluetooth.max_history_size = 10
+
+--[[
+Button press history functions
+--]]
+
+function Bluetooth:getKeyCodeForEvent(event_name)
+    -- Reverse lookup: find which key code maps to this event name
+    -- Check Device.input.event_map first (runtime mappings)
+    local event_map = Device.input and Device.input.event_map
+    if event_map then
+        for code, name in pairs(event_map) do
+            if name == event_name then
+                return code
+            end
+        end
+    end
+    -- Fall back to our default mappings
+    for code, name in pairs(self.default_event_mappings) do
+        if name == event_name then
+            return code
+        end
+    end
+    return nil
+end
+
+function Bluetooth:logButtonPress(event_name, key_code, action_num, target_event)
+    -- If key_code not provided, try to look it up
+    if not key_code then
+        key_code = self:getKeyCodeForEvent(event_name)
+    end
+    
+    local entry = {
+        timestamp = os.date("%H:%M:%S"),
+        event_name = event_name,
+        key_code = key_code,
+        action_num = action_num,
+        target_event = target_event,
+        bank = self.current_bank,
+    }
+    
+    -- Add to front of history
+    table.insert(self.button_press_history, 1, entry)
+    
+    -- Trim to max size
+    while #self.button_press_history > self.max_history_size do
+        table.remove(self.button_press_history)
+    end
+end
+
+function Bluetooth:getButtonPressHistory()
+    return self.button_press_history
+end
+
+function Bluetooth:clearButtonPressHistory()
+    self.button_press_history = {}
+end
+
+function Bluetooth:isBluetoothOn()
+    -- Actually check if Bluetooth is running by querying hci0 interface
+    -- This is more reliable than tracking state manually
+    local result = self:executeCommand("hciconfig hci0 2>&1")
+    if result and result:match("UP RUNNING") then
+        self.is_bluetooth_on = true
+        return true
+    else
+        self.is_bluetooth_on = false
+        return false
+    end
+end
+
+function Bluetooth:readRawInputEvents(timeout_secs)
+    -- Read raw input events from the input device using evtest
+    -- This uses a timeout to avoid blocking forever
+    timeout_secs = timeout_secs or 5
+    local events = {}
+    
+    local cmd = string.format("timeout %ds cat %s 2>/dev/null | od -An -tx1 -w24 | head -20", 
+        timeout_secs, self.input_device_path)
+    
+    local handle = io.popen(cmd)
+    if not handle then
+        return events
+    end
+    
+    local output = handle:read("*a")
+    handle:close()
+    
+    -- Parse the hex output - Linux input events are 24 bytes each:
+    -- struct input_event { time (16 bytes), type (2 bytes), code (2 bytes), value (4 bytes) }
+    -- For simplicity, we'll use evtest if available, otherwise parse manually
+    
+    -- Try evtest approach (more readable output)
+    local evtest_cmd = string.format("timeout %ds evtest %s 2>/dev/null | grep -E 'type [0-9]+' | head -10", 
+        timeout_secs, self.input_device_path)
+    handle = io.popen(evtest_cmd)
+    if handle then
+        output = handle:read("*a")
+        handle:close()
+        
+        -- Parse evtest output like: "Event: time ..., type 1 (EV_KEY), code 19 (KEY_R), value 1"
+        for line in output:gmatch("[^\n]+") do
+            local evt_type, code, value = line:match("type (%d+).*code (%d+).*value (%d+)")
+            if evt_type and code and value then
+                table.insert(events, {
+                    type = tonumber(evt_type),
+                    code = tonumber(code),
+                    value = tonumber(value),
+                })
+            end
+        end
+    end
+    
+    return events
+end
+
+--[[
+Config management functions
+--]]
+
+function Bluetooth:getConfigPath()
+    return self.path .. "/" .. self.config_file
+end
+
+function Bluetooth:loadConfig()
+    local config_path = self:getConfigPath()
+    local file = io.open(config_path, "r")
+    if not file then
+        -- Return default config
+        return {
+            device_mac = nil,
+            device_name = nil,
+        }
+    end
+    
+    local content = file:read("*all")
+    file:close()
+    
+    -- Parse the Lua config file
+    local ok, config = pcall(function()
+        return dofile(config_path)
+    end)
+    
+    if ok and type(config) == "table" then
+        return config
+    end
+    
+    return {
+        device_mac = nil,
+        device_name = nil,
+    }
+end
+
+function Bluetooth:saveConfig(config)
+    local config_path = self:getConfigPath()
+    local file = io.open(config_path, "w")
+    if not file then
+        return false, "Could not open config file for writing"
+    end
+    
+    file:write("-- Bluetooth plugin configuration\n")
+    file:write("-- Auto-generated, do not edit manually\n\n")
+    file:write("return {\n")
+    
+    if config.device_mac then
+        file:write(string.format("    device_mac = %q,\n", config.device_mac))
+    else
+        file:write("    device_mac = nil,\n")
+    end
+    
+    if config.device_name then
+        file:write(string.format("    device_name = %q,\n", config.device_name))
+    else
+        file:write("    device_name = nil,\n")
+    end
+    
+    file:write("}\n")
+    file:close()
+    
+    return true
+end
+
+function Bluetooth:getSavedDeviceMAC()
+    local config = self:loadConfig()
+    return config.device_mac, config.device_name
+end
+
+function Bluetooth:saveDeviceMAC(mac, name)
+    local config = self:loadConfig()
+    config.device_mac = mac
+    config.device_name = name
+    return self:saveConfig(config)
+end
+
+--[[
+Bluetooth scanning and device management
+--]]
+
+function Bluetooth:startScan(duration)
+    -- Start Bluetooth scanning with auto-timeout (default 30 seconds)
+    -- This prevents dangling processes and ensures scan stops automatically
+    duration = duration or 30
+    
+    -- First stop any existing scan
+    self:stopScan()
+    
+    -- Start scan with timeout - will auto-stop after duration seconds
+    os.execute(string.format(
+        "timeout %ds bluetoothctl scan on > /dev/null 2>&1 &",
+        duration
+    ))
+    return true
+end
+
+function Bluetooth:stopScan()
+    -- Stop Bluetooth scanning properly
+    -- 1. Kill any running bluetoothctl scan process
+    os.execute("pkill -f 'bluetoothctl scan' 2>/dev/null")
+    
+    -- 2. Send scan off command to bluetooth daemon (quick, non-blocking)
+    os.execute("echo 'scan off' | bluetoothctl > /dev/null 2>&1 &")
+    return true
+end
+
+function Bluetooth:executeCommandWithTimeout(cmd, timeout_secs)
+    -- Execute a command with a timeout to prevent freezing
+    -- Note: On Kobo, 'timeout' may not exist, so we try without it as fallback
+    timeout_secs = timeout_secs or 3
+    
+    -- First try with timeout command
+    local full_cmd = string.format("timeout %ds %s 2>&1", timeout_secs, cmd)
+    local handle = io.popen(full_cmd)
+    if not handle then
+        return ""
+    end
+    local result = handle:read("*a")
+    handle:close()
+    
+    -- If timeout command doesn't exist, it may return error - try direct command
+    if result and result:match("timeout:") then
+        handle = io.popen(cmd .. " 2>&1")
+        if handle then
+            result = handle:read("*a")
+            handle:close()
+        end
+    end
+    
+    return result or ""
+end
+
+function Bluetooth:getScannedDevices()
+    -- Get list of discovered devices (with timeout to prevent freeze)
+    local result = self:executeCommandWithTimeout("bluetoothctl devices", 3)
+    local devices = {}
+    
+    for line in result:gmatch("[^\r\n]+") do
+        -- Parse lines like: "Device E4:17:D8:7D:3D:69 8BitDo Micro gamepad"
+        local mac, name = line:match("Device%s+([%x:]+)%s+(.+)")
+        if mac and name then
+            table.insert(devices, {
+                mac = mac,
+                name = name,
+            })
+        end
+    end
+    
+    return devices
+end
+
+function Bluetooth:getPairedDevices()
+    -- Get list of paired devices (with timeout to prevent freeze)
+    local result = self:executeCommandWithTimeout("bluetoothctl paired-devices", 3)
+    local devices = {}
+    
+    for line in result:gmatch("[^\r\n]+") do
+        -- Parse lines like: "Device E4:17:D8:7D:3D:69 8BitDo Micro gamepad"
+        local mac, name = line:match("Device%s+([%x:]+)%s+(.+)")
+        if mac and name then
+            table.insert(devices, {
+                mac = mac,
+                name = name,
+            })
+        end
+    end
+    
+    return devices
+end
+
+function Bluetooth:connectToDevice(mac)
+    -- Connect to a specific device by MAC address
+    local result = self:executeCommand("timeout 5s bluetoothctl connect " .. mac)
+    local success = result:match("Connection successful") ~= nil
+    return success, result
+end
+
+function Bluetooth:connectToSavedDevice()
+    -- Connect to the saved device
+    local mac, name = self:getSavedDeviceMAC()
+    if not mac then
+        return false, "No device saved. Please scan and select a device first."
+    end
+    
+    local success, result = self:connectToDevice(mac)
+    if success then
+        return true, "Connected to " .. (name or mac)
+    else
+        return false, "Failed to connect to " .. (name or mac) .. "\n\n" .. result
+    end
+end
 
 function Bluetooth:onDispatcherRegisterActions()
     Dispatcher:registerAction("bluetooth_on_action", {category="none", event="BluetoothOn", title=_("Bluetooth On"), general=true})
@@ -226,10 +610,12 @@ end
 
 -- Bank navigation functions
 function Bluetooth:onBTRemoteNextBank()
+    self:logButtonPress("BTRemoteNextBank", nil, nil, "nextBank")
     self:nextBank()
 end
 
 function Bluetooth:onBTRemotePrevBank()
+    self:logButtonPress("BTRemotePrevBank", nil, nil, "prevBank")
     self:prevBank()
 end
 
@@ -428,9 +814,12 @@ end
 
 function Bluetooth:executeBankAction(action_num)
     local current_bank_config = self.banks[self.current_bank]
-    if not current_bank_config then return end
     
-    local target_event = current_bank_config[action_num]
+    -- Log this button press for diagnostics
+    local target_event = current_bank_config and current_bank_config[action_num] or nil
+    self:logButtonPress("BTAction" .. action_num, nil, action_num, target_event)
+    
+    if not current_bank_config then return end
     if not target_event then return end
     
     -- Execute the mapped event
@@ -441,11 +830,17 @@ end
 
 
 function Bluetooth:init()
+    -- Apply any saved auto-corrections first (before other init)
+    self:applyStartupFixes()
+    
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
 
     self:registerKeyEvents()
     self:loadBankConfig()
+    
+    -- Set input device path based on device model
+    self.input_device_path, self.input_path_is_known = self:getInputDevicePath()
 end
 
 function Bluetooth:addToMainMenu(menu_items)
@@ -482,19 +877,920 @@ function Bluetooth:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Reconnect to Device"),
-                callback = function()
-                    self:onConnectToDevice()
+                text = _("Device Management"),
+                sub_item_table_func = function()
+                    return self:getDeviceManagementMenu()
                 end,
             },
             {
-                text = _("Refresh Device Input"), -- New menu item
+                text = _("Refresh Device Input"),
                 callback = function()
                     self:onRefreshPairing()
                 end,
             },
+            {
+                text = _("Diagnostics"),
+                sub_item_table_func = function()
+                    return self:getDiagnosticsMenu()
+                end,
+            },
         },
     }
+end
+
+function Bluetooth:getDeviceManagementMenu()
+    local menu = {}
+    
+    -- Check actual Bluetooth state (syncs is_bluetooth_on with reality)
+    local bt_on = self:isBluetoothOn()
+    
+    -- Show Bluetooth status at top
+    table.insert(menu, {
+        text = bt_on and _("🔵 Bluetooth is ON") or _("⚫ Bluetooth is OFF"),
+        enabled = false,
+    })
+    
+    -- Show current saved device
+    local saved_mac, saved_name = self:getSavedDeviceMAC()
+    local saved_text = saved_name and saved_mac 
+        and string.format("%s (%s)", saved_name, saved_mac)
+        or _("No device configured")
+    
+    table.insert(menu, {
+        text = _("Current device: ") .. saved_text,
+        keep_menu_open = true,
+        callback = function()
+            if saved_mac then
+                self:popup(_("Saved Bluetooth device:\n\n") ..
+                    _("Name: ") .. (saved_name or "Unknown") .. "\n" ..
+                    _("MAC: ") .. saved_mac, 5)
+            else
+                self:popup(_("No Bluetooth device configured yet.\n\nUse 'Scan for devices' to find and select a device."), 5)
+            end
+        end,
+    })
+    
+    -- Connect to saved device
+    table.insert(menu, {
+        text = _("Connect to saved device"),
+        enabled_func = function() return self.is_bluetooth_on and saved_mac ~= nil end,
+        callback = function()
+            local success, result = self:connectToSavedDevice()
+            if success then
+                self:popup(_("✓ ") .. result, 3)
+            else
+                self:popup(_("✗ ") .. result, 5)
+            end
+        end,
+    })
+    
+    -- Separator
+    table.insert(menu, {
+        text = "───────────────",
+        enabled = false,
+    })
+    
+    -- Start scan
+    table.insert(menu, {
+        text = _("Start scanning (30s)"),
+        enabled_func = function() return self.is_bluetooth_on end,
+        callback = function()
+            self:startScan(30)
+            self:popup(_("Bluetooth scanning started.\n\nScan will automatically stop after 30 seconds.\n\nDevices will appear in 'Select from scanned devices'."), 4)
+        end,
+    })
+    
+    -- Stop scan
+    table.insert(menu, {
+        text = _("Stop scanning"),
+        enabled_func = function() return self.is_bluetooth_on end,
+        callback = function()
+            self:stopScan()
+            self:popup(_("Bluetooth scanning stopped."), 2)
+        end,
+    })
+    
+    -- Select from scanned devices
+    table.insert(menu, {
+        text = _("Select from scanned devices"),
+        enabled_func = function() return self.is_bluetooth_on end,
+        sub_item_table_func = function()
+            return self:getScannedDevicesMenu()
+        end,
+    })
+    
+    -- Select from paired devices  
+    table.insert(menu, {
+        text = _("Select from paired devices"),
+        enabled_func = function() return self.is_bluetooth_on end,
+        sub_item_table_func = function()
+            return self:getPairedDevicesMenu()
+        end,
+    })
+    
+    return menu
+end
+
+function Bluetooth:getScannedDevicesMenu()
+    local devices = self:getScannedDevices()
+    local menu = {}
+    
+    if #devices == 0 then
+        table.insert(menu, {
+            text = _("No devices found. Start scanning first."),
+            enabled = false,
+        })
+        -- Debug option to see raw output
+        table.insert(menu, {
+            text = _("(Debug: Show raw output)"),
+            callback = function()
+                -- Try direct command without timeout wrapper
+                local handle = io.popen("bluetoothctl devices 2>&1")
+                local raw = ""
+                if handle then
+                    raw = handle:read("*a") or ""
+                    handle:close()
+                end
+                self:popup(_("Raw bluetoothctl output:\n\n") .. (raw == "" and "(empty)" or raw), 10)
+            end,
+        })
+    else
+        for _, device in ipairs(devices) do
+            table.insert(menu, {
+                text = string.format("%s (%s)", device.name, device.mac),
+                callback = function()
+                    self:onSelectDevice(device.mac, device.name)
+                end,
+            })
+        end
+    end
+    
+    return menu
+end
+
+function Bluetooth:getPairedDevicesMenu()
+    local devices = self:getPairedDevices()
+    local menu = {}
+    
+    if #devices == 0 then
+        table.insert(menu, {
+            text = _("No paired devices found."),
+            enabled = false,
+        })
+    else
+        for _, device in ipairs(devices) do
+            table.insert(menu, {
+                text = string.format("%s (%s)", device.name, device.mac),
+                callback = function()
+                    self:onSelectDevice(device.mac, device.name)
+                end,
+            })
+        end
+    end
+    
+    return menu
+end
+
+function Bluetooth:onSelectDevice(mac, name)
+    -- Save the selected device
+    local success = self:saveDeviceMAC(mac, name)
+    if success then
+        self:popup(_("✓ Device saved!\n\n") ..
+            _("Name: ") .. name .. "\n" ..
+            _("MAC: ") .. mac .. "\n\n" ..
+            _("Use 'Connect to saved device' to connect."), 5)
+    else
+        self:popup(_("✗ Failed to save device configuration."), 5)
+    end
+end
+
+-- Supported device models (codename -> friendly name)
+Bluetooth.supported_devices = {
+    ["Kobo_io"] = "Kobo Libra 2",
+    ["Kobo_goldfinch"] = "Kobo Clara 2E",
+}
+
+function Bluetooth:getDeviceInfo()
+    -- Gather device information for diagnostics
+    local info = {
+        model = Device.model or "unknown",
+        isKobo = Device:isKobo() and true or false,
+        isEmulator = Device:isEmulator() and true or false,
+        isSDL = Device:isSDL() and true or false,
+    }
+    return info
+end
+
+function Bluetooth:checkDeviceType()
+    local info = self:getDeviceInfo()
+    
+    -- Check if device is a Kobo
+    if not info.isKobo then
+        return false, nil, info
+    end
+    
+    -- Check if it's a supported model
+    local friendly_name = self.supported_devices[info.model]
+    
+    if friendly_name then
+        return true, friendly_name, info
+    else
+        return false, nil, info
+    end
+end
+
+function Bluetooth:getActualKoreaderPath()
+    -- Get the actual KOReader installation path using DataStorage
+    return DataStorage:getFullDataDir()
+end
+
+function Bluetooth:findHighestEventPath()
+    -- Find the highest eventX in /dev/input/
+    local input_dir = "/dev/input"
+    local highest_num = -1
+    local highest_path = nil
+    
+    local lfs = require("libs/libkoreader-lfs")
+    local ok, iter, dir_obj = pcall(lfs.dir, input_dir)
+    if not ok then
+        return nil
+    end
+    
+    for entry in iter, dir_obj do
+        local event_num = entry:match("^event(%d+)$")
+        if event_num then
+            local num = tonumber(event_num)
+            if num and num > highest_num then
+                highest_num = num
+                highest_path = input_dir .. "/" .. entry
+            end
+        end
+    end
+    
+    return highest_path
+end
+
+function Bluetooth:getInputDevicePath()
+    -- Determine the correct input device path based on device model
+    local model = Device.model
+    local path = self.device_input_paths[model]
+    if path then
+        return path, true  -- known path
+    end
+    
+    -- Try to find the highest event number as best guess
+    local guessed_path = self:findHighestEventPath()
+    if guessed_path then
+        return guessed_path, false  -- guessed path
+    end
+    
+    return self.default_input_path, false  -- fallback
+end
+
+function Bluetooth:detectBluetoothBinaries()
+    -- Check which Bluetooth binaries exist in /sbin
+    local lfs = require("libs/libkoreader-lfs")
+    local binaries_found = {}
+    
+    -- Check for rtk_hciattach (Realtek chip, used by Libra 2)
+    local rtk_attr = lfs.attributes("/sbin/rtk_hciattach")
+    if rtk_attr then
+        table.insert(binaries_found, "rtk_hciattach")
+    end
+    
+    -- Check for hciattach (standard, used by Clara 2E)
+    local hci_attr = lfs.attributes("/sbin/hciattach")
+    if hci_attr then
+        table.insert(binaries_found, "hciattach")
+    end
+    
+    return binaries_found
+end
+
+function Bluetooth:getBluetoothConfig()
+    -- Get device-specific Bluetooth configuration
+    -- Priority: 1) Known device model, 2) Binary detection, 3) Default
+    local model = Device.model
+    
+    -- First try: known device model
+    local config = self.device_bt_configs[model]
+    if config then
+        return config, "known_device", model
+    end
+    
+    -- Second try: detect by checking which binaries exist in /sbin
+    local binaries = self:detectBluetoothBinaries()
+    
+    -- Prefer rtk_hciattach if found (Libra 2 style)
+    for _, binary in ipairs(binaries) do
+        if binary == "rtk_hciattach" then
+            local detected_config = self.binary_to_config["rtk_hciattach"]
+            return detected_config, "binary_detected", "rtk_hciattach"
+        end
+    end
+    
+    -- Fall back to hciattach if found (Clara 2E style)
+    for _, binary in ipairs(binaries) do
+        if binary == "hciattach" then
+            local detected_config = self.binary_to_config["hciattach"]
+            return detected_config, "binary_detected", "hciattach"
+        end
+    end
+    
+    -- Last resort: default config
+    return self.default_bt_config, "default", nil
+end
+
+function Bluetooth:getDiagnosticsMenu()
+    local diagnostics = {}
+    
+    -- Check Bluetooth status first (actual system check)
+    local bt_on = self:isBluetoothOn()
+    local bt_icon = bt_on and "🔵 " or "⚫ "
+    
+    table.insert(diagnostics, {
+        text = bt_icon .. (bt_on and _("Bluetooth is ON") or _("Bluetooth is OFF")),
+        callback = function()
+            -- Re-check when clicked
+            local is_on = self:isBluetoothOn()
+            local hci_output = self:executeCommand("hciconfig hci0 2>&1")
+            self:popup((is_on and _("✓ Bluetooth is currently ON\n\n") or _("✗ Bluetooth is currently OFF\n\n")) ..
+                _("HCI interface status:\n") .. (hci_output or "(no output)"), 10)
+        end,
+    })
+    
+    -- Separator
+    table.insert(diagnostics, {
+        text = "─── " .. _("Configuration Checks") .. " ───",
+        enabled = false,
+    })
+    
+    -- Info 1: Installation path (auto-detected, always correct)
+    local actual_path = self:getActualKoreaderPath()
+    
+    table.insert(diagnostics, {
+        text = "ℹ " .. _("KOReader installation path"),
+        callback = function()
+            self:popup(_("KOReader installation path (auto-detected):\n\n") .. (actual_path or "unknown") .. "\n\n" .. _("This path is used for WiFi scripts."), 5)
+        end,
+    })
+    
+    -- Check 2: Device type
+    local device_ok, friendly_name, device_info = self:checkDeviceType()
+    local device_icon = device_ok and "✓ " or "✗ "
+    
+    table.insert(diagnostics, {
+        text = device_icon .. _("Device type"),
+        callback = function()
+            -- Build device info string for display
+            local info_str = _("Detected device info:\n") ..
+                _("  Model: ") .. device_info.model .. "\n" ..
+                _("  isKobo: ") .. tostring(device_info.isKobo) .. "\n" ..
+                _("  isEmulator: ") .. tostring(device_info.isEmulator) .. "\n" ..
+                _("  isSDL: ") .. tostring(device_info.isSDL)
+            
+            if device_ok then
+                self:popup(_("✓ Supported device detected:\n") .. friendly_name .. "\n(" .. device_info.model .. ")\n\n" .. info_str, 7)
+            else
+                local msg
+                if not device_info.isKobo then
+                    msg = _("✗ This is not a Kobo device!\n\n") ..
+                        info_str .. "\n\n" ..
+                        _("This plugin only supports Kobo devices.\n\n") ..
+                        _("Supported devices:\n") ..
+                        _("• Kobo Libra 2\n") ..
+                        _("• Kobo Clara 2E")
+                else
+                    msg = _("✗ Unsupported Kobo model!\n\n") ..
+                        info_str .. "\n\n" ..
+                        _("Supported devices:\n") ..
+                        _("• Kobo Libra 2 (Kobo_io)\n") ..
+                        _("• Kobo Clara 2E (Kobo_goldfinch)\n\n") ..
+                        _("Corrective action:\n") ..
+                        _("This plugin may still work if your device has compatible Bluetooth hardware. Check the 'Bluetooth commands' diagnostic to see if binaries were auto-detected.")
+                end
+                self:popup(msg, 10)
+            end
+        end,
+    })
+    
+    -- Check 3: hasKeys flag
+    local has_keys = Device:hasKeys() and true or false
+    local keys_icon = has_keys and "✓ " or "✗ "
+    
+    table.insert(diagnostics, {
+        text = keys_icon .. _("hasKeys flag"),
+        callback = function()
+            -- Re-check in case it changed
+            local current_has_keys = Device:hasKeys() and true or false
+            
+            if current_has_keys then
+                self:popup(_("✓ hasKeys is enabled.\n\nYour device is configured to accept key input from external devices."), 5)
+            else
+                local msg = _("✗ hasKeys is NOT enabled!\n\n") ..
+                    _("This is required for Bluetooth input devices to work.\n\n") ..
+                    _("This can be corrected automatically. The fix will be applied immediately and remembered for future sessions.")
+                
+                UIManager:show(ConfirmBox:new{
+                    text = msg,
+                    ok_text = _("Correct Automatically"),
+                    cancel_text = _("Cancel"),
+                    ok_callback = function()
+                        local success, result = self:autoCorrectHasKeys()
+                        if success then
+                            self:popup(_("✓ ") .. result, 5)
+                        else
+                            self:popup(_("✗ Auto-correction failed:\n") .. result, 7)
+                        end
+                    end,
+                })
+            end
+        end,
+    })
+    
+    -- Check 4: Input device path
+    local model = Device.model or "unknown"
+    local current_path = self.input_device_path
+    local path_is_known = self.input_path_is_known
+    local path_icon = path_is_known and "✓ " or "⚠ "
+    
+    table.insert(diagnostics, {
+        text = path_icon .. _("Input device path"),
+        callback = function()
+            if path_is_known then
+                self:popup(_("✓ Input device path is configured for your device.\n\n") ..
+                    _("Model: ") .. model .. "\n" ..
+                    _("Path: ") .. current_path, 5)
+            else
+                local msg = _("⚠ Input device path is auto-detected!\n\n") ..
+                    _("Model: ") .. model .. "\n" ..
+                    _("Path: ") .. current_path .. _(" (highest event found)\n\n") ..
+                    _("Your device model is not in the known device list. ") ..
+                    _("The system detected the highest /dev/input/eventX as a best guess.\n\n") ..
+                    _("If Bluetooth input doesn't work, try editing the plugin to add your device to device_input_paths with the correct event path.")
+                self:popup(msg, 10)
+            end
+        end,
+    })
+    
+    -- Check 5: Bluetooth configuration
+    local bt_config, bt_detection_type, bt_detection_info = self:getBluetoothConfig()
+    local bt_icon
+    if bt_detection_type == "known_device" then
+        bt_icon = "✓ "
+    elseif bt_detection_type == "binary_detected" then
+        bt_icon = "ℹ "  -- Info: auto-detected but should work
+    else
+        bt_icon = "⚠ "  -- Warning: using defaults
+    end
+    
+    table.insert(diagnostics, {
+        text = bt_icon .. _("Bluetooth commands"),
+        callback = function()
+            local model = Device.model or "unknown"
+            local binaries = self:detectBluetoothBinaries()
+            local binaries_str = #binaries > 0 and table.concat(binaries, ", ") or "none found"
+            
+            if bt_detection_type == "known_device" then
+                self:popup(_("✓ Bluetooth commands configured for your device.\n\n") ..
+                    _("Device: ") .. bt_config.name .. "\n" ..
+                    _("Model: ") .. model .. "\n\n" ..
+                    _("HCI attach: ") .. bt_config.hci_attach .. "\n\n" ..
+                    _("HCI kill: ") .. bt_config.hci_kill .. "\n\n" ..
+                    _("Binaries in /sbin: ") .. binaries_str, 10)
+            elseif bt_detection_type == "binary_detected" then
+                self:popup(_("ℹ Bluetooth commands auto-detected!\n\n") ..
+                    _("Detection: ") .. (bt_config.detection_method or bt_detection_info) .. "\n" ..
+                    _("Config: ") .. bt_config.name .. "\n" ..
+                    _("Model: ") .. model .. "\n\n" ..
+                    _("HCI attach: ") .. bt_config.hci_attach .. "\n\n" ..
+                    _("HCI kill: ") .. bt_config.hci_kill .. "\n\n" ..
+                    _("Binaries in /sbin: ") .. binaries_str .. "\n\n" ..
+                    _("Your device model is unknown, but the plugin detected which Bluetooth binaries exist and will use the appropriate commands."), 12)
+            else
+                local msg = _("⚠ Using default Bluetooth commands!\n\n") ..
+                    _("Model: ") .. model .. "\n" ..
+                    _("Config: ") .. bt_config.name .. _(" (fallback)\n\n") ..
+                    _("HCI attach: ") .. bt_config.hci_attach .. "\n\n" ..
+                    _("Binaries in /sbin: ") .. binaries_str .. "\n\n" ..
+                    _("No known Bluetooth binaries found in /sbin. Using default commands (Clara 2E style).\n\n") ..
+                    _("If Bluetooth doesn't work, you may need to add your device to device_bt_configs in the plugin.")
+                self:popup(msg, 12)
+            end
+        end,
+    })
+    
+    -- Check 6: Event map entries (any BT* events)
+    local event_map_ok, bt_events_found, event_map_error = self:checkEventMapEntries()
+    local event_map_icon = event_map_ok and "✓ " or "✗ "
+    
+    table.insert(diagnostics, {
+        text = event_map_icon .. _("Event map (BT events)"),
+        callback = function()
+            -- Re-check in case it changed
+            local ok, found, err = self:checkEventMapEntries()
+            
+            if err then
+                self:popup(_("✗ Error checking event map:\n\n") .. err, 5)
+            elseif ok then
+                self:popup(_("✓ Event map has BT event entries.\n\n") ..
+                    _("Found ") .. #found .. _(" BT mappings:\n") ..
+                    table.concat(found, ", "), 7)
+            else
+                local msg = _("✗ Event map has no BT event entries!\n\n") ..
+                    _("Bluetooth button presses won't be recognized without BT event mappings.\n\n") ..
+                    _("This can be corrected automatically by creating a custom event_map.lua file with default BTAction mappings.")
+                
+                -- Show ConfirmBox with auto-correct option
+                UIManager:show(ConfirmBox:new{
+                    text = msg,
+                    ok_text = _("Correct Automatically"),
+                    cancel_text = _("Cancel"),
+                    ok_callback = function()
+                        local success, result = self:autoCorrectEventMap()
+                        if success then
+                            self:popup(_("✓ ") .. result, 7)
+                        else
+                            self:popup(_("✗ Auto-correction failed:\n") .. result, 7)
+                        end
+                    end,
+                })
+            end
+        end,
+    })
+    
+    -- Check 7: Bank configuration (BTAction indirections)
+    local bank_config_ok, bank_count, total_mappings = self:checkBankConfig()
+    local bank_icon = bank_config_ok and "✓ " or "⚠ "
+    
+    table.insert(diagnostics, {
+        text = bank_icon .. _("Bank configuration"),
+        callback = function()
+            local ok, num_banks, num_mappings, details = self:checkBankConfigDetails()
+            if ok then
+                local msg = _("✓ Bank configuration loaded.\n\n") ..
+                    _("Banks defined: ") .. num_banks .. "\n" ..
+                    _("Total mappings: ") .. num_mappings .. "\n" ..
+                    _("Current bank: ") .. self.current_bank .. "\n\n" ..
+                    details
+                self:popup(msg, 15)
+            else
+                self:popup(_("⚠ Bank configuration issue!\n\n") .. details, 10)
+            end
+        end,
+    })
+    
+    -- Check 8: Saved Bluetooth device
+    local saved_mac, saved_name = self:getSavedDeviceMAC()
+    local device_saved = saved_mac ~= nil
+    local saved_icon = device_saved and "✓ " or "✗ "
+    
+    table.insert(diagnostics, {
+        text = saved_icon .. _("Saved Bluetooth device"),
+        callback = function()
+            local mac, name = self:getSavedDeviceMAC()
+            if mac then
+                self:popup(_("✓ Bluetooth device is configured.\n\n") ..
+                    _("Name: ") .. (name or "Unknown") .. "\n" ..
+                    _("MAC: ") .. mac, 5)
+            else
+                self:popup(_("✗ No Bluetooth device configured!\n\n") ..
+                    _("Go to Bluetooth > Device Management to scan for and select a device."), 5)
+            end
+        end,
+    })
+    
+    -- Separator before debug tools
+    table.insert(diagnostics, {
+        text = "─── " .. _("Debug Tools") .. " ───",
+        enabled = false,
+    })
+    
+    -- Button press history viewer
+    local history_count = #self.button_press_history
+    table.insert(diagnostics, {
+        text = "🔍 " .. _("Button press history") .. " (" .. history_count .. ")",
+        callback = function()
+            local history = self:getButtonPressHistory()
+            if #history == 0 then
+                self:popup(_("No button presses recorded yet.\n\n") ..
+                    _("Press some buttons on your Bluetooth controller and check back here."), 5)
+            else
+                local lines = {}
+                for i, entry in ipairs(history) do
+                    local code_str = entry.key_code and string.format("code %d", entry.key_code) or "code ?"
+                    local line = string.format("%d. [%s] %s (%s)", 
+                        i, entry.timestamp, entry.event_name, code_str)
+                    if entry.target_event then
+                        line = line .. "\n   → " .. entry.target_event .. " [Bank " .. (entry.bank or "?") .. "]"
+                    else
+                        line = line .. "\n   → (no mapping)"
+                    end
+                    table.insert(lines, line)
+                end
+                self:popup(_("Last ") .. #history .. _(" button presses:\n\n") .. table.concat(lines, "\n"), 20)
+            end
+        end,
+    })
+    
+    -- Clear button press history
+    table.insert(diagnostics, {
+        text = "🗑 " .. _("Clear button history"),
+        callback = function()
+            self:clearButtonPressHistory()
+            self:popup(_("Button press history cleared."), 2)
+        end,
+    })
+    
+    -- Raw input device monitor (reads actual key codes from device)
+    table.insert(diagnostics, {
+        text = "📡 " .. _("Monitor raw input (5 sec)"),
+        callback = function()
+            self:popup(_("Reading raw input from:\n") .. self.input_device_path .. _("\n\nPress buttons on your controller now..."), 2)
+            
+            -- Schedule the actual read after popup closes
+            UIManager:scheduleIn(0.5, function()
+                local raw_events = self:readRawInputEvents(5)
+                if #raw_events == 0 then
+                    self:popup(_("No input events detected in 5 seconds.\n\n") ..
+                        _("Make sure:\n") ..
+                        _("• Bluetooth is on\n") ..
+                        _("• Controller is connected\n") ..
+                        _("• Input device path is correct: ") .. self.input_device_path, 7)
+                else
+                    local lines = {}
+                    for _, evt in ipairs(raw_events) do
+                        table.insert(lines, string.format("Code: %d, Value: %d, Type: %d", 
+                            evt.code, evt.value, evt.type))
+                    end
+                    self:popup(_("Raw input events captured:\n\n") .. table.concat(lines, "\n"), 10)
+                end
+            end)
+        end,
+    })
+    
+    return diagnostics
+end
+
+function Bluetooth:checkBankConfig()
+    -- Quick check: do we have banks loaded with mappings?
+    if not self.banks or next(self.banks) == nil then
+        return false, 0, 0
+    end
+    
+    local bank_count = 0
+    local total_mappings = 0
+    
+    for bank_num, bank in pairs(self.banks) do
+        bank_count = bank_count + 1
+        for action_num, target in pairs(bank) do
+            total_mappings = total_mappings + 1
+        end
+    end
+    
+    return bank_count > 0 and total_mappings > 0, bank_count, total_mappings
+end
+
+function Bluetooth:checkBankConfigDetails()
+    -- Detailed check with per-bank breakdown
+    local config_path = self.path .. "/" .. self.bank_config_file
+    
+    -- Check if file exists
+    local file = io.open(config_path, "r")
+    if not file then
+        return false, 0, 0, _("bank_config.txt not found at:\n") .. config_path
+    end
+    file:close()
+    
+    if not self.banks or next(self.banks) == nil then
+        return false, 0, 0, _("No banks loaded. Check bank_config.txt format.")
+    end
+    
+    local bank_count = 0
+    local total_mappings = 0
+    local details_lines = {}
+    
+    -- Get sorted bank numbers
+    local bank_nums = {}
+    for bank_num, _ in pairs(self.banks) do
+        table.insert(bank_nums, bank_num)
+    end
+    table.sort(bank_nums)
+    
+    for _, bank_num in ipairs(bank_nums) do
+        local bank = self.banks[bank_num]
+        bank_count = bank_count + 1
+        local mapping_count = 0
+        local action_nums = {}
+        
+        for action_num, target in pairs(bank) do
+            mapping_count = mapping_count + 1
+            total_mappings = total_mappings + 1
+            table.insert(action_nums, action_num)
+        end
+        table.sort(action_nums)
+        
+        -- Build action list string
+        local actions_str = ""
+        for _, num in ipairs(action_nums) do
+            if actions_str ~= "" then actions_str = actions_str .. "," end
+            actions_str = actions_str .. num
+        end
+        
+        local bank_marker = bank_num == self.current_bank and " ← current" or ""
+        table.insert(details_lines, string.format("Bank %d: %d mappings (BTAction %s)%s", 
+            bank_num, mapping_count, actions_str, bank_marker))
+    end
+    
+    -- Check for unmapped BTActions in event_map
+    local event_map = Device.input and Device.input.event_map
+    local unmapped_actions = {}
+    if event_map then
+        for code, event_name in pairs(event_map) do
+            if type(event_name) == "string" and event_name:match("^BTAction(%d+)$") then
+                local action_num = tonumber(event_name:match("BTAction(%d+)"))
+                -- Check if this action is defined in current bank
+                local current_bank_config = self.banks[self.current_bank]
+                if current_bank_config and not current_bank_config[action_num] then
+                    table.insert(unmapped_actions, string.format("%s (code %d)", event_name, code))
+                end
+            end
+        end
+    end
+    
+    if #unmapped_actions > 0 then
+        table.insert(details_lines, "")
+        table.insert(details_lines, _("⚠ BTActions in event_map but NOT in current bank:"))
+        for _, action in ipairs(unmapped_actions) do
+            table.insert(details_lines, "  • " .. action)
+        end
+    end
+    
+    return true, bank_count, total_mappings, table.concat(details_lines, "\n")
+end
+
+function Bluetooth:checkEventMapEntries()
+    -- Check if Device.input.event_map contains any BT* entries (BTAction, BTRemote, etc.)
+    local found = {}
+    
+    local event_map = Device.input and Device.input.event_map
+    if not event_map then
+        -- No event_map available
+        return false, {}, "event_map not accessible"
+    end
+    
+    -- Scan event_map for all BT* entries (any event starting with "BT")
+    for key, value in pairs(event_map) do
+        if type(value) == "string" and value:match("^BT") then
+            table.insert(found, value)
+        end
+    end
+    
+    -- Sort found for display
+    table.sort(found)
+    
+    -- OK if we have at least one BT entry
+    local ok = #found > 0
+    return ok, found, nil
+end
+
+function Bluetooth:getCustomEventMapPath()
+    return DataStorage:getSettingsDir() .. "/event_map.lua"
+end
+
+function Bluetooth:writeCustomEventMap()
+    -- Write the default BTAction mappings to settings/event_map.lua
+    local path = self:getCustomEventMapPath()
+    local file = io.open(path, "w")
+    if not file then
+        return false, "Could not open file for writing: " .. path
+    end
+    
+    -- Write the Lua table
+    file:write("-- Custom event map for Bluetooth plugin (8BitDo controller)\n")
+    file:write("-- Auto-generated by bluetooth.koplugin\n")
+    file:write("-- This file is loaded by KOReader on startup\n\n")
+    file:write("return {\n")
+    
+    -- Sort keys for consistent output
+    local keys = {}
+    for k, _ in pairs(self.default_event_mappings) do
+        table.insert(keys, k)
+    end
+    table.sort(keys)
+    
+    for _, key in ipairs(keys) do
+        local value = self.default_event_mappings[key]
+        file:write(string.format("    [%d] = \"%s\",\n", key, value))
+    end
+    
+    file:write("}\n")
+    file:close()
+    
+    return true, path
+end
+
+function Bluetooth:injectEventMappings()
+    -- Inject BTAction mappings into Device.input.event_map at runtime
+    local event_map = Device.input and Device.input.event_map
+    if not event_map then
+        return false, "event_map not accessible"
+    end
+    
+    local count = 0
+    for key, value in pairs(self.default_event_mappings) do
+        event_map[key] = value
+        count = count + 1
+    end
+    
+    return true, count
+end
+
+function Bluetooth:autoCorrectEventMap()
+    -- Step 1: Write the custom event_map.lua file (persists across restarts)
+    local write_ok, write_result = self:writeCustomEventMap()
+    if not write_ok then
+        return false, write_result
+    end
+    
+    -- Step 2: Inject mappings into current session (immediate effect)
+    local inject_ok, inject_result = self:injectEventMappings()
+    if not inject_ok then
+        return true, "File written to " .. write_result .. " but runtime injection failed: " .. inject_result .. "\n\nPlease restart KOReader for changes to take effect."
+    end
+    
+    return true, "Event mappings configured!\n\nFile: " .. write_result .. "\nMappings injected: " .. inject_result .. "\n\nBluetooth buttons should work immediately."
+end
+
+function Bluetooth:enableHasKeys()
+    -- Override Device.hasKeys to return true
+    Device.hasKeys = function() return true end
+    return true
+end
+
+function Bluetooth:getHasKeysPatchPath()
+    return DataStorage:getDataDir() .. "/patches/1-bluetooth-haskeys.lua"
+end
+
+function Bluetooth:writeHasKeysPatch()
+    -- Create the patches directory if it doesn't exist
+    local patches_dir = DataStorage:getDataDir() .. "/patches"
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(patches_dir, "mode") ~= "directory" then
+        lfs.mkdir(patches_dir)
+    end
+    
+    -- Write the patch file
+    local patch_path = self:getHasKeysPatchPath()
+    local file = io.open(patch_path, "w")
+    if not file then
+        return false, "Could not create patch file: " .. patch_path
+    end
+    
+    file:write([[-- Auto-generated by bluetooth.koplugin
+-- This patch enables hasKeys for Bluetooth controller support
+-- It runs early during boot, before Device is initialized
+
+local Device = require("device")
+
+-- Store original hasKeys function
+local orig_hasKeys = Device.hasKeys
+
+-- Override to always return true (for Bluetooth controller support)
+Device.hasKeys = function() return true end
+]])
+    file:close()
+    
+    return true, patch_path
+end
+
+function Bluetooth:hasKeysPatchExists()
+    local lfs = require("libs/libkoreader-lfs")
+    return lfs.attributes(self:getHasKeysPatchPath(), "mode") == "file"
+end
+
+function Bluetooth:autoCorrectHasKeys()
+    -- Step 1: Enable hasKeys at runtime (immediate effect for this session)
+    self:enableHasKeys()
+    
+    -- Step 2: Create user patch for early boot (persists across restarts)
+    local write_ok, write_result = self:writeHasKeysPatch()
+    if not write_ok then
+        return false, "Runtime fix applied, but patch file creation failed:\n" .. write_result .. "\n\nRestart may be needed."
+    end
+    
+    return true, "hasKeys is now enabled!\n\nPatch file created:\n" .. write_result .. "\n\nThis will apply early on boot, before Device initialization."
+end
+
+function Bluetooth:applyStartupFixes()
+    -- Apply any saved auto-corrections on startup
+    -- Note: The user patch runs even earlier (before Device init),
+    -- but this provides a fallback for the current session
+    
+    -- Check if the patch exists but hasn't taken effect yet (first run after creating patch)
+    if self:hasKeysPatchExists() and not Device:hasKeys() then
+        self:enableHasKeys()
+    end
 end
 
 function Bluetooth:getScriptPath(script)
@@ -509,22 +1805,52 @@ function Bluetooth:executeScript(script)
     return result
 end
 
+function Bluetooth:executeCommand(cmd)
+    local handle = io.popen(cmd .. " 2>&1")
+    local result = handle:read("*a")
+    handle:close()
+    return result
+end
+
+function Bluetooth:turnOnBluetoothCommands()
+    -- Get device-specific Bluetooth config
+    local bt_config, _ = self:getBluetoothConfig()
+    local plugin_path = self.path
+    local results = {}
+    
+    -- Step 1: Load Bluetooth power module
+    table.insert(results, self:executeCommand("insmod /drivers/mx6sll-ntx/wifi/sdio_bt_pwr.ko"))
+    
+    -- Step 2: Load UHID module (from plugin directory)
+    table.insert(results, self:executeCommand("insmod " .. plugin_path .. "/uhid/uhid.ko"))
+    
+    -- Step 3: Attach HCI (device-specific command)
+    table.insert(results, self:executeCommand(bt_config.hci_attach))
+    
+    -- Step 4: Initialize D-Bus/BlueZ
+    table.insert(results, self:executeCommand("dbus-send --system --dest=org.bluez --print-reply / org.freedesktop.DBus.ObjectManager.GetManagedObjects"))
+    
+    -- Step 5: Bring up HCI interface
+    table.insert(results, self:executeCommand("hciconfig hci0 up"))
+    
+    return table.concat(results, "\n")
+end
+
 function Bluetooth:onBluetoothOn()
-    local script = self:getScriptPath("on.sh")
-    local result = self:executeScript(script)
+    local bt_config, detection_type, detection_info = self:getBluetoothConfig()
+    local result = self:turnOnBluetoothCommands()
 
-    if not result or result == "" then
-        self:popup(_("Error: No result from the Bluetooth script"))
-        self.is_bluetooth_on = false
-        return
-    end
-
-    if result:match("complete") then
-        self.is_bluetooth_on = true
-        self:popup(_("Bluetooth turned on."))
+    -- Check if hci0 is up as success indicator (also updates cache)
+    if self:isBluetoothOn() then
+        local config_note = ""
+        if detection_type == "binary_detected" then
+            config_note = _("\n(Auto-detected: ") .. (detection_info or "unknown") .. ")"
+        elseif detection_type == "default" then
+            config_note = _("\n(Using default config)")
+        end
+        self:popup(_("Bluetooth turned on.") .. config_note)
     else
-        self:popup(_("Result: ") .. result)
-        self.is_bluetooth_on = false
+        self:popup(_("Bluetooth may not have started correctly.\n\nDetails:\n") .. result)
     end
 end
 
@@ -534,13 +1860,29 @@ function Bluetooth:onBluetoothOff()
 end
 
 function Bluetooth:turnOffBluetooth()
-    local script = self:getScriptPath("off.sh")
-    local result = self:executeScript(script)
-    self.is_bluetooth_on = false
+    -- Get device-specific Bluetooth config
+    local bt_config, _ = self:getBluetoothConfig()
+    local plugin_path = self.path
+    
+    -- Step 1: Bring down HCI interface
+    self:executeCommand("hciconfig hci0 down")
+    
+    -- Step 2: Kill HCI attach process (device-specific)
+    self:executeCommand(bt_config.hci_kill)
+    
+    -- Step 3: Kill bluetoothd
+    self:executeCommand("pkill bluetoothd")
+    
+    -- Step 4: Unload Bluetooth power module
+    self:executeCommand("rmmod -w /drivers/mx6sll-ntx/wifi/sdio_bt_pwr.ko")
+    
+    -- Step 5: Unload UHID module
+    self:executeCommand("rmmod -w " .. plugin_path .. "/uhid/uhid.ko")
+    -- Note: is_bluetooth_on cache will be updated on next isBluetoothOn() call
 end
 
 function Bluetooth:onRefreshPairing()
-    if not self.is_bluetooth_on then
+    if not self:isBluetoothOn() then
         self:popup(_("Bluetooth is off. Please turn it on before refreshing pairing."))
         return
     end
@@ -562,22 +1904,18 @@ function Bluetooth:onRefreshPairing()
 end
 
 function Bluetooth:onConnectToDevice()
-    if not self.is_bluetooth_on then
+    if not self:isBluetoothOn() then
         self:popup(_("Bluetooth is off. Please turn it on before connecting to a device."))
         return
     end
 
-    local script = self:getScriptPath("connect.sh")
-    local result = self:executeScript(script)
-
-    -- Simplify the message: focus on the success and device name
-    local device_name = result:match("Name:%s*(.-)\n")  -- Extract the device name
-    local success = result:match("Connection successful")  -- Check if connection was successful
-
-    if success and device_name then
-        self:popup(_("Connection successful: ") .. device_name)
+    -- Use saved device MAC address from config
+    local success, result = self:connectToSavedDevice()
+    
+    if success then
+        self:popup(_("✓ ") .. result)
     else
-        self:popup(_("Result: ") .. result)  -- Show full result for debugging if something goes wrong
+        self:popup(_("✗ ") .. result)
     end
 end
 
@@ -608,8 +1946,9 @@ function Bluetooth:isWifiEnabled()
 end
 
 function Bluetooth:enableWifi()
-    -- Use the exact path provided
-    local enable_wifi_script = "/mnt/onboard/.koreader/enable-wifi.sh"
+    -- Use dynamically detected KOReader path
+    local koreader_path = self:getActualKoreaderPath()
+    local enable_wifi_script = koreader_path .. "/enable-wifi.sh"
     
     -- Check if script exists
     local file = io.open(enable_wifi_script, "r")
@@ -619,7 +1958,7 @@ function Bluetooth:enableWifi()
     file:close()
     
     -- Execute the script from its directory
-    local command = string.format("sh -c 'cd /mnt/onboard/.koreader && ./enable-wifi.sh'")
+    local command = string.format("sh -c 'cd %s && ./enable-wifi.sh'", koreader_path)
     
     local result = os.execute(command)
     if result == 0 then
@@ -630,8 +1969,9 @@ function Bluetooth:enableWifi()
 end
 
 function Bluetooth:disableWifi()
-    -- Use the exact path provided
-    local disable_wifi_script = "/mnt/onboard/.koreader/disable-wifi.sh"
+    -- Use dynamically detected KOReader path
+    local koreader_path = self:getActualKoreaderPath()
+    local disable_wifi_script = koreader_path .. "/disable-wifi.sh"
     
     -- Check if script exists
     local file = io.open(disable_wifi_script, "r")
@@ -641,7 +1981,7 @@ function Bluetooth:disableWifi()
     file:close()
     
     -- Execute the script from its directory
-    local command = string.format("sh -c 'cd /mnt/onboard/.koreader && ./disable-wifi.sh'")
+    local command = string.format("sh -c 'cd %s && ./disable-wifi.sh'", koreader_path)
     
     local result = os.execute(command)
     if result == 0 then
@@ -669,6 +2009,13 @@ function Bluetooth:onWifiUpAndBluetoothOn()
 end
 
 function Bluetooth:onFullBluetoothSetup()
+    -- Check if we have a saved device
+    local saved_mac, saved_name = self:getSavedDeviceMAC()
+    if not saved_mac then
+        self:popup(_("No Bluetooth device configured!\n\nPlease go to Device Management and select a device first."), 5)
+        return
+    end
+    
     -- Step 1: Enable WiFi
     self:popup(_("Step 1: Enabling WiFi..."), 4)
     local success, message = self:enableWifi()
@@ -684,20 +2031,13 @@ function Bluetooth:onFullBluetoothSetup()
         -- Step 2: Enable Bluetooth
         UIManager:scheduleIn(1, function()
             self:popup(_("Step 2: Turning on Bluetooth..."), 4)
-            local script = self:getScriptPath("on.sh")
-            local result = self:executeScript(script)
+            local result = self:turnOnBluetoothCommands()
             
-            if not result or result == "" then
-                self:popup(_("Error: No result from Bluetooth script"), 4)
-                return
-            end
-            
-            if not result:match("complete") then
+            -- Check if hci0 is up as success indicator (also updates cache)
+            if not self:isBluetoothOn() then
                 self:popup(_("Bluetooth error: ") .. result, 4)
                 return
             end
-            
-            self.is_bluetooth_on = true
             
             -- Wait a bit, then show completion and move to next step
             UIManager:scheduleIn(1, function()
@@ -705,13 +2045,17 @@ function Bluetooth:onFullBluetoothSetup()
                 
                 -- Step 3: Connect to device
                 UIManager:scheduleIn(1, function()
-                    self:popup(_("Step 3: Connecting to device..."), 4)
-                    local connect_script = self:getScriptPath("connect.sh")
-                    local connect_result = self:executeScript(connect_script)
+                    self:popup(_("Step 3: Connecting to ") .. (saved_name or saved_mac) .. "...", 4)
+                    local connect_success, connect_result = self:connectToSavedDevice()
+                    
+                    if not connect_success then
+                        self:popup(_("Connection failed: ") .. connect_result, 4)
+                        -- Continue anyway to try refreshing input
+                    end
                     
                     -- Wait a bit, then show completion and move to next step
                     UIManager:scheduleIn(1, function()
-                        self:popup(_("✓ Device connected"), 2)
+                        self:popup(connect_success and _("✓ Device connected") or _("⚠ Connection may have failed"), 2)
                         
                         -- Step 4: Refresh device input
                         UIManager:scheduleIn(1, function()
