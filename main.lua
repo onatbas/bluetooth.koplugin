@@ -278,16 +278,9 @@ function Bluetooth:stopLiveCapture()
 end
 
 function Bluetooth:isBluetoothOn()
-    -- Actually check if Bluetooth is running by querying hci0 interface
-    -- This is more reliable than tracking state manually
-    local result = self:executeCommand("hciconfig hci0 2>&1")
-    if result and result:match("UP RUNNING") then
-        self.is_bluetooth_on = true
-        return true
-    else
-        self.is_bluetooth_on = false
-        return false
-    end
+    -- SIMPLIFIED: Always return true (BT managed by Kobo native)
+    self.is_bluetooth_on = true
+    return true
 end
 
 -- Common Linux input event key codes for reference
@@ -527,8 +520,8 @@ function Bluetooth:saveConfig(config)
 end
 
 function Bluetooth:getSavedDeviceMAC()
-    local config = self:loadConfig()
-    return config.device_mac, config.device_name
+    -- SIMPLIFIED: No saved device tracking
+    return nil, nil
 end
 
 function Bluetooth:saveDeviceMAC(mac, name)
@@ -543,28 +536,13 @@ Bluetooth scanning and device management
 --]]
 
 function Bluetooth:startScan(duration)
-    -- Start Bluetooth scanning with auto-timeout (default 30 seconds)
-    -- This prevents dangling processes and ensures scan stops automatically
-    duration = duration or 30
-    
-    -- First stop any existing scan
-    self:stopScan()
-    
-    -- Start scan with timeout - will auto-stop after duration seconds
-    os.execute(string.format(
-        "timeout %ds bluetoothctl scan on > /dev/null 2>&1 &",
-        duration
-    ))
+    -- SIMPLIFIED: No-op (BT managed by Kobo native)
+    self:popup(_("Please use Kobo's native Bluetooth settings to scan."), 3)
     return true
 end
 
 function Bluetooth:stopScan()
-    -- Stop Bluetooth scanning properly
-    -- 1. Kill any running bluetoothctl scan process
-    os.execute("pkill -f 'bluetoothctl scan' 2>/dev/null")
-    
-    -- 2. Send scan off command to bluetooth daemon (quick, non-blocking)
-    os.execute("echo 'scan off' | bluetoothctl > /dev/null 2>&1 &")
+    -- SIMPLIFIED: No-op (BT managed by Kobo native)
     return true
 end
 
@@ -595,48 +573,19 @@ function Bluetooth:executeCommandWithTimeout(cmd, timeout_secs)
 end
 
 function Bluetooth:getScannedDevices()
-    -- Get list of discovered devices (with timeout to prevent freeze)
-    local result = self:executeCommandWithTimeout("bluetoothctl devices", 3)
-    local devices = {}
-    
-    for line in result:gmatch("[^\r\n]+") do
-        -- Parse lines like: "Device E4:17:D8:7D:3D:69 8BitDo Micro gamepad"
-        local mac, name = line:match("Device%s+([%x:]+)%s+(.+)")
-        if mac and name then
-            table.insert(devices, {
-                mac = mac,
-                name = name,
-            })
-        end
-    end
-    
-    return devices
+    -- SIMPLIFIED: Return empty (BT managed by Kobo native)
+    return {}
 end
 
 function Bluetooth:getPairedDevices()
-    -- Get list of paired devices (with timeout to prevent freeze)
-    local result = self:executeCommandWithTimeout("bluetoothctl paired-devices", 3)
-    local devices = {}
-    
-    for line in result:gmatch("[^\r\n]+") do
-        -- Parse lines like: "Device E4:17:D8:7D:3D:69 8BitDo Micro gamepad"
-        local mac, name = line:match("Device%s+([%x:]+)%s+(.+)")
-        if mac and name then
-            table.insert(devices, {
-                mac = mac,
-                name = name,
-            })
-        end
-    end
-    
-    return devices
+    -- SIMPLIFIED: Return empty (BT managed by Kobo native)
+    return {}
 end
 
 function Bluetooth:connectToDevice(mac)
-    -- Connect to a specific device by MAC address
-    local result = self:executeCommand("timeout 5s bluetoothctl connect " .. mac)
-    local success = result:match("Connection successful") ~= nil
-    return success, result
+    -- SIMPLIFIED: No-op (BT managed by Kobo native)
+    self:popup(_("Please use Kobo's native Bluetooth settings to connect."), 3)
+    return true, "Use Kobo settings"
 end
 
 function Bluetooth:connectToSavedDevice()
@@ -1946,62 +1895,22 @@ function Bluetooth:showEventSelector(code, mappings)
 end
 
 function Bluetooth:getScannedDevicesMenu()
-    local devices = self:getScannedDevices()
+    -- SIMPLIFIED: Direct to Kobo native
     local menu = {}
-    
-    if #devices == 0 then
-        table.insert(menu, {
-            text = _("No devices found. Start scanning first."),
-            enabled = false,
-        })
-        -- Debug option to see raw output
-        table.insert(menu, {
-            text = _("(Debug: Show raw output)"),
-            callback = function()
-                -- Try direct command without timeout wrapper
-                local handle = io.popen("bluetoothctl devices 2>&1")
-                local raw = ""
-                if handle then
-                    raw = handle:read("*a") or ""
-                    handle:close()
-                end
-                self:popup(_("Raw bluetoothctl output:\n\n") .. (raw == "" and "(empty)" or raw), 10)
-            end,
-        })
-    else
-        for _, device in ipairs(devices) do
-            table.insert(menu, {
-                text = string.format("%s (%s)", device.name, device.mac),
-                callback = function()
-                    self:onSelectDevice(device.mac, device.name)
-                end,
-            })
-        end
-    end
-    
+    table.insert(menu, {
+        text = _("Please use Kobo's native Bluetooth settings to scan."),
+        enabled = false,
+    })
     return menu
 end
 
 function Bluetooth:getPairedDevicesMenu()
-    local devices = self:getPairedDevices()
+    -- SIMPLIFIED: Direct to Kobo native
     local menu = {}
-    
-    if #devices == 0 then
-        table.insert(menu, {
-            text = _("No paired devices found."),
-            enabled = false,
-        })
-    else
-        for _, device in ipairs(devices) do
-            table.insert(menu, {
-                text = string.format("%s (%s)", device.name, device.mac),
-                callback = function()
-                    self:onSelectDevice(device.mac, device.name)
-                end,
-            })
-        end
-    end
-    
+    table.insert(menu, {
+        text = _("Please use Kobo's native Bluetooth settings to manage devices."),
+        enabled = false,
+    })
     return menu
 end
 
@@ -2084,70 +1993,14 @@ function Bluetooth:findHighestEventPath()
     return highest_path
 end
 
-function Bluetooth:findInputDeviceByBluetoothName()
-    -- Try to find input device by matching against saved Bluetooth device name
-    -- Returns: path, device_name if found; nil, nil otherwise
-    
-    local saved_mac, saved_name = self:getSavedDeviceMAC()
-    if not saved_name then
-        return nil, nil, "No saved Bluetooth device"
-    end
-    
-    -- Get all input devices
-    local devices = self:listAllInputDevices()
-    if #devices == 0 then
-        return nil, nil, "No input devices found"
-    end
-    
-    -- Try exact match first (case-insensitive)
-    local saved_lower = saved_name:lower()
-    for _, dev in ipairs(devices) do
-        if dev.name then
-            local dev_lower = dev.name:lower()
-            if dev_lower == saved_lower then
-                return dev.path, dev.name, "exact_match"
-            end
-        end
-    end
-    
-    -- Try partial match (saved name contains or is contained in device name)
-    for _, dev in ipairs(devices) do
-        if dev.name then
-            local dev_lower = dev.name:lower()
-            -- Check if one contains the other
-            if dev_lower:find(saved_lower, 1, true) or saved_lower:find(dev_lower, 1, true) then
-                return dev.path, dev.name, "partial_match"
-            end
-        end
-    end
-    
-    return nil, nil, "No matching device found"
-end
-
 function Bluetooth:getInputDevicePath()
-    -- Determine the correct input device path
-    -- Priority: 1) Match by Bluetooth device name, 2) Known device model, 3) Highest event, 4) Default
-    
-    -- First try: match by saved Bluetooth device name
-    local matched_path, matched_name, match_type = self:findInputDeviceByBluetoothName()
-    if matched_path then
-        return matched_path, true, "bt_name_match", matched_name
-    end
-    
-    -- Second try: known device model
-    local model = Device.model
-    local path = self.device_input_paths[model]
-    if path then
-        return path, true, "device_model", model  -- known path
-    end
-    
-    -- Third try: find the highest event number as best guess
+    -- SIMPLIFIED: Just find the highest event device (most likely the BT controller)
     local guessed_path = self:findHighestEventPath()
     if guessed_path then
-        return guessed_path, false, "highest_event", nil  -- guessed path
+        return guessed_path, false, "highest_event", nil
     end
     
-    return self.default_input_path, false, "default", nil  -- fallback
+    return "/dev/input/event3", false, "default", nil  -- fallback
 end
 
 function Bluetooth:updateInputDevicePath()
@@ -2260,13 +2113,9 @@ function Bluetooth:getDiagnosticsMenu()
     local bt_icon = bt_on and "🔵 " or "⚫ "
     
     table.insert(diagnostics, {
-        text = bt_icon .. (bt_on and _("Bluetooth is ON") or _("Bluetooth is OFF")),
+        text = _("ℹ Bluetooth managed by Kobo native"),
         callback = function()
-            -- Re-check when clicked
-            local is_on = self:isBluetoothOn()
-            local hci_output = self:executeCommand("hciconfig hci0 2>&1")
-            self:popup((is_on and _("✓ Bluetooth is currently ON\n\n") or _("✗ Bluetooth is currently OFF\n\n")) ..
-                _("HCI interface status:\n") .. (hci_output or "(no output)"), 10)
+            self:popup(_("This version does not manage Bluetooth directly.\n\nUse Kobo's native Bluetooth settings to:\n• Turn Bluetooth on/off\n• Scan and pair devices\n\nOnce connected, use 'Refresh Device Input'."), 10)
         end,
     })
     
@@ -3245,104 +3094,22 @@ function Bluetooth:executeCommand(cmd)
 end
 
 function Bluetooth:turnOnBluetoothCommands()
-    -- Get device-specific Bluetooth config
-    local bt_config, _ = self:getBluetoothConfig()
-    local plugin_path = self.path
-    local results = {}
-    
-    -- Determine driver path (from config or auto-detect)
-    local driver_path = bt_config.driver_path or self:detectBluetoothDriverPath()
-    
-    -- Step 1: Load Bluetooth power module
-    if driver_path then
-        local driver_result = self:executeCommand("insmod " .. driver_path)
-        if driver_result and driver_result:match("No such file") then
-            table.insert(results, "Driver not found: " .. driver_path)
-        else
-            table.insert(results, driver_result)
-        end
-    else
-        table.insert(results, "Warning: No Bluetooth driver path found")
-    end
-    
-    -- Step 2: Load UHID module (from plugin directory)
-    table.insert(results, self:executeCommand("insmod " .. plugin_path .. "/uhid/uhid.ko"))
-    
-    -- Step 3: Attach HCI (device-specific command)
-    table.insert(results, self:executeCommand(bt_config.hci_attach))
-    
-    -- Step 4: Initialize D-Bus/BlueZ (silently - we don't need the verbose output)
-    os.execute("dbus-send --system --dest=org.bluez / org.freedesktop.DBus.ObjectManager.GetManagedObjects > /dev/null 2>&1")
-    
-    -- Step 5: Bring up HCI interface
-    table.insert(results, self:executeCommand("hciconfig hci0 up"))
-    
-    return table.concat(results, "\n")
+    -- SIMPLIFIED: No-op (BT managed by Kobo native)
+    return "Bluetooth managed by Kobo native settings"
 end
 
 function Bluetooth:onBluetoothOn()
-    local bt_config, detection_type, detection_info = self:getBluetoothConfig()
-    local result = self:turnOnBluetoothCommands()
-
-    -- Check if hci0 is up as success indicator (also updates cache)
-    if self:isBluetoothOn() then
-        local config_note = ""
-        if detection_type == "binary_detected" then
-            config_note = _("\n(Auto-detected: ") .. (detection_info or "unknown") .. ")"
-        elseif detection_type == "default" then
-            config_note = _("\n(Using default config)")
-        end
-        self:popup(_("Bluetooth turned on.") .. config_note)
-    else
-        -- Truncate long results to avoid huge popups
-        local short_result = result or ""
-        if #short_result > 500 then
-            short_result = short_result:sub(1, 500) .. "\n...(truncated)"
-        end
-        -- Provide helpful troubleshooting info
-        local msg = _("Bluetooth may not have started correctly.\n\n")
-        msg = msg .. _("Check Diagnostics for more info.\n\n")
-        if detection_type == "default" then
-            msg = msg .. _("Note: Using default config. Your device may need different drivers.\n\n")
-        end
-        if short_result ~= "" then
-            msg = msg .. _("Details:\n") .. short_result
-        end
-        self:popup(msg, 10)
-    end
+    -- SIMPLIFIED: Redirect to Kobo native
+    self:popup(_("Please use Kobo's native Bluetooth settings to turn on Bluetooth.\n\nOnce connected, use 'Refresh Device Input'."), 5)
 end
 
 function Bluetooth:onBluetoothOff()
-    self:turnOffBluetooth()
-    self:popup(_("Bluetooth turned off."))
+    -- SIMPLIFIED: Redirect to Kobo native
+    self:popup(_("Please use Kobo's native Bluetooth settings to turn off Bluetooth."), 5)
 end
 
 function Bluetooth:turnOffBluetooth()
-    -- Get device-specific Bluetooth config
-    local bt_config, _ = self:getBluetoothConfig()
-    local plugin_path = self.path
-    
-    -- Determine driver path (from config or auto-detect)
-    local driver_path = bt_config.driver_path or self:detectBluetoothDriverPath()
-    
-    -- Step 1: Bring down HCI interface
-    self:executeCommand("hciconfig hci0 down")
-    
-    -- Step 2: Kill HCI attach process (device-specific)
-    self:executeCommand(bt_config.hci_kill)
-    
-    -- Step 3: Kill bluetoothd
-    self:executeCommand("pkill bluetoothd")
-    
-    -- Step 4: Unload Bluetooth power module
-    if driver_path then
-        -- For rmmod, we just need the module name, not the full path
-        self:executeCommand("rmmod sdio_bt_pwr")
-    end
-    
-    -- Step 5: Unload UHID module
-    self:executeCommand("rmmod uhid")
-    -- Note: is_bluetooth_on cache will be updated on next isBluetoothOn() call
+    -- SIMPLIFIED: No-op (BT managed by Kobo native)
 end
 
 function Bluetooth:onRefreshPairing()
