@@ -1041,37 +1041,9 @@ function Bluetooth:addToMainMenu(menu_items)
         sorting_hint = "network",
         sub_item_table = {
             {
-                text = _("Full Setup (WiFi + BT + Connect + Refresh)"),
+                text = _("Refresh Device Input"),
                 callback = function()
-                    self:onFullBluetoothSetup()
-                end,
-            },
-            {
-                text = _("Wifi Up & Bluetooth On"),
-                callback = function()
-                    self:onWifiUpAndBluetoothOn()
-                end,
-            },
-            {
-                text = _("Bluetooth on"),
-                callback = function()
-                    if not self:isWifiEnabled() then
-                        self:popup("Please turn on Wi-Fi to continue.")
-                    else
-                        self:onBluetoothOn()
-                    end
-                end,
-            },
-            {
-                text = _("Bluetooth off"),
-                callback = function()
-                    self:onBluetoothOff()
-                end,
-            },
-            {
-                text = _("Device Management"),
-                sub_item_table_func = function()
-                    return self:getDeviceManagementMenu()
+                    self:onRefreshPairing()
                 end,
             },
             {
@@ -1081,16 +1053,34 @@ function Bluetooth:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Refresh Device Input"),
-                callback = function()
-                    self:onRefreshPairing()
-                end,
-            },
-            {
                 text = _("Diagnostics"),
                 sub_item_table_func = function()
                     return self:getDiagnosticsMenu()
                 end,
+            },
+            {
+                text = "─── " .. _("Disabled (use Kobo native)") .. " ───",
+                enabled = false,
+            },
+            {
+                text = _("Full Setup (WiFi + BT + Connect)"),
+                enabled = false,
+            },
+            {
+                text = _("Wifi Up & Bluetooth On"),
+                enabled = false,
+            },
+            {
+                text = _("Bluetooth on"),
+                enabled = false,
+            },
+            {
+                text = _("Bluetooth off"),
+                enabled = false,
+            },
+            {
+                text = _("Device Management"),
+                enabled = false,
             },
         },
     }
@@ -2254,51 +2244,10 @@ function Bluetooth:getDiagnosticsMenu()
         end,
     })
     
-    -- Check 5: Bluetooth configuration
-    local bt_config, bt_detection_type, bt_detection_info = self:getBluetoothConfig()
-    local bt_icon
-    if bt_detection_type == "known_device" then
-        bt_icon = "✓ "
-    elseif bt_detection_type == "binary_detected" then
-        bt_icon = "ℹ "  -- Info: auto-detected but should work
-    else
-        bt_icon = "⚠ "  -- Warning: using defaults
-    end
-    
+    -- Check 5: Bluetooth configuration (disabled - managed by Kobo native)
     table.insert(diagnostics, {
-        text = bt_icon .. _("Bluetooth commands"),
-        callback = function()
-            local model = Device.model or "unknown"
-            local binaries = self:detectBluetoothBinaries()
-            local binaries_str = #binaries > 0 and table.concat(binaries, ", ") or "none found"
-            
-            if bt_detection_type == "known_device" then
-                self:popup(_("✓ Bluetooth commands configured for your device.\n\n") ..
-                    _("Device: ") .. bt_config.name .. "\n" ..
-                    _("Model: ") .. model .. "\n\n" ..
-                    _("HCI attach: ") .. bt_config.hci_attach .. "\n\n" ..
-                    _("HCI kill: ") .. bt_config.hci_kill .. "\n\n" ..
-                    _("Binaries in /sbin: ") .. binaries_str, 10)
-            elseif bt_detection_type == "binary_detected" then
-                self:popup(_("ℹ Bluetooth commands auto-detected!\n\n") ..
-                    _("Detection: ") .. (bt_config.detection_method or bt_detection_info) .. "\n" ..
-                    _("Config: ") .. bt_config.name .. "\n" ..
-                    _("Model: ") .. model .. "\n\n" ..
-                    _("HCI attach: ") .. bt_config.hci_attach .. "\n\n" ..
-                    _("HCI kill: ") .. bt_config.hci_kill .. "\n\n" ..
-                    _("Binaries in /sbin: ") .. binaries_str .. "\n\n" ..
-                    _("Your device model is unknown, but the plugin detected which Bluetooth binaries exist and will use the appropriate commands."), 12)
-            else
-                local msg = _("⚠ Using default Bluetooth commands!\n\n") ..
-                    _("Model: ") .. model .. "\n" ..
-                    _("Config: ") .. bt_config.name .. _(" (fallback)\n\n") ..
-                    _("HCI attach: ") .. bt_config.hci_attach .. "\n\n" ..
-                    _("Binaries in /sbin: ") .. binaries_str .. "\n\n" ..
-                    _("No known Bluetooth binaries found in /sbin. Using default commands (Clara 2E style).\n\n") ..
-                    _("If Bluetooth doesn't work, you may need to add your device to device_bt_configs in the plugin.")
-                self:popup(msg, 12)
-            end
-        end,
+        text = _("─ Bluetooth commands (N/A)"),
+        enabled = false,
     })
     
     -- Check 6: Event map entries (any BT* events)
@@ -2423,24 +2372,10 @@ function Bluetooth:getDiagnosticsMenu()
         end,
     })
     
-    -- Check 8: Saved Bluetooth device
-    local saved_mac, saved_name = self:getSavedDeviceMAC()
-    local device_saved = saved_mac ~= nil
-    local saved_icon = device_saved and "✓ " or "✗ "
-    
+    -- Check 8: Saved Bluetooth device (disabled - managed by Kobo native)
     table.insert(diagnostics, {
-        text = saved_icon .. _("Saved Bluetooth device"),
-        callback = function()
-            local mac, name = self:getSavedDeviceMAC()
-            if mac then
-                self:popup(_("✓ Bluetooth device is configured.\n\n") ..
-                    _("Name: ") .. (name or "Unknown") .. "\n" ..
-                    _("MAC: ") .. mac, 5)
-            else
-                self:popup(_("✗ No Bluetooth device configured!\n\n") ..
-                    _("Go to Bluetooth > Device Management to scan for and select a device."), 5)
-            end
-        end,
+        text = _("─ Saved Bluetooth device (N/A)"),
+        enabled = false,
     })
     
     -- Separator before debug tools
