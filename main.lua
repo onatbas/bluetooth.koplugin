@@ -3396,8 +3396,6 @@ function Bluetooth:onRefreshPairing()
 end
 
 function Bluetooth:toggleInputWatching()
-    local lfs = require("libs/libkoreader-lfs")
-    
     if self._watching then
         -- Stop watching
         self._watching = false
@@ -3406,38 +3404,23 @@ function Bluetooth:toggleInputWatching()
         return
     end
     
-    -- Start watching: open device, record inode, start polling
-    local path = self:updateInputDevicePath()
-    if not path then
-        self:popup(_("No input device found."))
-        return
-    end
-    
-    pcall(function() Device.input:close(path) end)
-    Device.input:open(path)
-    
-    self._watch_path = path
-    self._watch_inode = (lfs.attributes(path) or {}).ino
+    -- Start watching: refresh device every second (silently)
     self._watching = true
     
     self._poll = function()
         if not self._watching then return end
-        local cur_inode = (lfs.attributes(self._watch_path) or {}).ino
-        if cur_inode ~= self._watch_inode then
-            local new_path = self:updateInputDevicePath()
-            if new_path then
-                pcall(function() Device.input:close(self._watch_path) end)
-                pcall(function() Device.input:close(new_path) end)
-                pcall(function() Device.input:open(new_path) end)
-                self._watch_path = new_path
-                self._watch_inode = (lfs.attributes(new_path) or {}).ino
+        if self:isBluetoothOn() then
+            local path = self:updateInputDevicePath()
+            if path and path ~= "" then
+                pcall(function() Device.input:close(path) end)
+                pcall(function() Device.input:open(path) end)
             end
         end
         UIManager:scheduleIn(1, self._poll)
     end
     
     UIManager:scheduleIn(1, self._poll)
-    self:popup(_("Watching: ") .. path, 2)
+    self:popup(_("Watching enabled."), 2)
 end
 
 function Bluetooth:onToggleInputWatching()
