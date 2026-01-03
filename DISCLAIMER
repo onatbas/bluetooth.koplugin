@@ -1,0 +1,48 @@
+DISCLAIMER OF WARRANTY AND LIABILITY
+
+This software is provided "AS IS" without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose, and noninfringement.
+
+USE AT YOUR OWN RISK
+
+This plugin interacts with low-level system components including:
+- Bluetooth hardware drivers
+- Input device interfaces
+- System kernel modules
+- Device firmware
+
+By using this software, you acknowledge and agree that:
+
+1. THE AUTHORS AND CONTRIBUTORS SHALL NOT BE LIABLE for any damages,
+   including but not limited to:
+   - Hardware damage to your device
+   - Data loss or corruption
+   - System instability or crashes
+   - Loss of device functionality
+   - Any other direct, indirect, incidental, special, or consequential damages
+
+2. This software may modify system behavior in ways that could potentially:
+   - Affect device stability
+   - Interfere with other system functions
+   - Cause unexpected behavior
+   - Require device reset or reconfiguration
+
+3. You are solely responsible for:
+   - Backing up your data before use
+   - Understanding the risks involved
+   - Testing on your specific device configuration
+   - Any consequences of using this software
+
+4. This software is provided for educational and experimental purposes.
+   While efforts have been made to ensure compatibility, there is no guarantee
+   that it will work on all devices or configurations.
+
+5. The authors make no representations or warranties regarding:
+   - Compatibility with your device
+   - Safety of use
+   - Continued functionality after system updates
+   - Support or maintenance
+
+If you do not agree to these terms, do not use this software.
+

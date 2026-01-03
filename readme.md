@@ -206,3 +206,15 @@ Bank system is intended for controllers with fewer buttons than intended number 
 
 - [MobileRead Discussion](https://www.mobileread.com/forums/showthread.php?p=4444741)
 - [KOReader Bluetooth Issue](https://github.com/koreader/koreader/issues/9059)
+
+## License
+
+This software is provided under the [MIT License](LICENSE). See [DISCLAIMER](DISCLAIMER) for important information.
+
+## ⚠️ Disclaimer
+
+**USE AT YOUR OWN RISK**
+
+This software interacts with low-level system components and hardware drivers. The authors and contributors are not liable for any damages, including but not limited to hardware damage, data loss, system instability, or loss of device functionality.
+
+By using this software, you acknowledge that you understand the risks and are solely responsible for any consequences. Please read the [LICENSE](LICENSE) and [DISCLAIMER](DISCLAIMER) files for complete terms.
