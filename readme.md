@@ -4,12 +4,46 @@ Use a Bluetooth controller (like 8BitDo Micro) to turn pages and control KOReade
 
 ## Supported Devices
 
-| Device | Status |
-|--------|--------|
-| Kobo Clara 2E | ✅ Fully tested |
-| Kobo Libra 2 | ✅ Fully tested |
-| Other Kobos | ⚠️ May work (auto-detection) |
-| Clara BW/Colour, Libra Colour | ❌ Not yet (MediaTek hardware) |
+| Device | Chipset | Status |
+|--------|---------|--------|
+| Kobo Clara 2E | i.MX6 | ✅ Fully tested |
+| Kobo Libra 2 | i.MX6 | ✅ Fully tested |
+| Other i.MX6 Kobos | i.MX6 | ⚠️ May work (auto-detection) |
+| Kobo Clara BW | MTK | ⚠️ Experimental |
+| Kobo Clara Colour | MTK | ⚠️ Experimental |
+| Kobo Libra Colour | MTK | ✅ Community Tested |
+| Kobo Elipsa 2E | MTK | ⚠️ Experimental |
+
+## MTK Device Support (Experimental)
+
+Support for MediaTek-based Kobo devices (Clara BW/Colour, Libra Colour, Elipsa 2E) is **experimental**, tests are conducted by community members; [Libra Colour](https://www.mobileread.com/forums/showpost.php?p=4557375&postcount=83) .
+
+### How It Works
+
+MTK devices use a completely different Bluetooth stack than older i.MX6 devices:
+- **i.MX6 devices**: Use `bluetoothctl` and `hciattach`
+- **MTK devices**: Use D-Bus service `com.kobo.mtk.bluedroid`
+
+The plugin auto-detects your device type and uses the appropriate method.
+
+### MTK-Specific Features
+
+- Bluetooth on/off via D-Bus (no kernel modules to load)
+- Device scanning and pairing via D-Bus
+- Smart input device detection using `uhid` pattern in `/sys/class/input/`
+- Device name matching between D-Bus and kernel input devices
+
+### Known Issues (MTK)
+
+**Kernel Panic on Nickel Return**: Due to non-idempotent MediaTek kernel drivers, returning to Nickel after using Bluetooth in KOReader may cause a kernel panic and device reboot. This is a known hardware/driver issue that cannot be fixed by the plugin.
+
+**Workaround**: Reboot your device before returning to Nickel if you've used Bluetooth.
+
+### Credits
+
+MTK Bluetooth support made possible by the excellent investigation and documentation by **OGKevin** and the kobo.koplugin project. Their thorough research into the MediaTek D-Bus interface (`com.kobo.mtk.bluedroid`) saved countless hours of reverse engineering.
+
+---
 
 ## Installation
 
@@ -200,12 +234,15 @@ Bank system is intended for controllers with fewer buttons than intended number 
 
 - Tested on Clara 2E and Libra 2
 - Libra 2 support thanks to MobileRead user **enji**
+- MTK device support thanks to **OGKevin** (kobo.koplugin project) for the comprehensive Bluetooth investigation and D-Bus documentation
+- MTK device testing thanks to MobileRead user **WaveEquation**
 - 8BitDo Micro controller recommended
 
 ## Links
 
 - [MobileRead Discussion](https://www.mobileread.com/forums/showthread.php?p=4444741)
 - [KOReader Bluetooth Issue](https://github.com/koreader/koreader/issues/9059)
+- [kobo.koreader Bluetooth Investigation](https://ogkevin.github.io/kobo.koplugin/dev/investigations/bluetooth/00-overview.html)
 
 ## License
 

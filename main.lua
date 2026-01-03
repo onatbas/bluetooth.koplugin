@@ -85,6 +85,50 @@ Bluetooth.binary_to_config = {
     },
 }
 
+-- MTK (MediaTek) device configurations
+-- These devices use D-Bus (com.kobo.mtk.bluedroid) instead of bluetoothctl
+Bluetooth.mtk_device_models = {
+    ["Kobo_condor"] = "Elipsa 2E",      -- MTK
+    ["Kobo_monza"] = "Libra Colour",    -- MTK
+    ["Kobo_spaBW"] = "Clara BW",        -- MTK
+    ["Kobo_spaColour"] = "Clara Colour", -- MTK
+}
+
+-- MTK D-Bus commands for Bluetooth control
+Bluetooth.mtk_dbus = {
+    -- Service destination (NOT org.bluez!)
+    dest = "com.kobo.mtk.bluedroid",
+    
+    -- Turn Bluetooth ON (auto-activates the service)
+    cmd_on = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid / com.kobo.bluetooth.BluedroidManager1.On',
+    
+    -- Power on the adapter after On()
+    cmd_power_on = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
+        .. 'org.freedesktop.DBus.Properties.Set '
+        .. 'string:org.bluez.Adapter1 string:Powered variant:boolean:true',
+    
+    -- Turn Bluetooth OFF
+    cmd_power_off = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
+        .. 'org.freedesktop.DBus.Properties.Set '
+        .. 'string:org.bluez.Adapter1 string:Powered variant:boolean:false',
+    cmd_off = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid / com.kobo.bluetooth.BluedroidManager1.Off',
+    
+    -- Check if Bluetooth is powered
+    cmd_check_powered = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
+        .. 'org.freedesktop.DBus.Properties.Get '
+        .. 'string:org.bluez.Adapter1 string:Powered 2>/dev/null',
+    
+    -- Start/stop discovery
+    cmd_start_discovery = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
+        .. 'org.bluez.Adapter1.StartDiscovery',
+    cmd_stop_discovery = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
+        .. 'org.bluez.Adapter1.StopDiscovery',
+    
+    -- Get all managed objects (devices)
+    cmd_get_devices = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid / '
+        .. 'org.freedesktop.DBus.ObjectManager.GetManagedObjects',
+}
+
 -- Default BTAction key mappings for 8BitDo controller
 -- These will be written to settings/event_map.lua if auto-correction is used
 Bluetooth.default_event_mappings = {
@@ -281,8 +325,12 @@ function Bluetooth:stopLiveCapture()
 end
 
 function Bluetooth:isBluetoothOn()
-    -- Actually check if Bluetooth is running by querying hci0 interface
-    -- This is more reliable than tracking state manually
+    -- Check device type and use appropriate method
+    if self:isMTKDevice() then
+        return self:isMTKBluetoothOn()
+    end
+    
+    -- i.MX6 devices: check if Bluetooth is running by querying hci0 interface
     local result = self:executeCommand("hciconfig hci0 2>&1")
     if result and result:match("UP RUNNING") then
         self.is_bluetooth_on = true
@@ -291,6 +339,312 @@ function Bluetooth:isBluetoothOn()
         self.is_bluetooth_on = false
         return false
     end
+end
+
+--[[
+MTK (MediaTek) Bluetooth Support Functions
+These functions handle Bluetooth on MTK-based Kobo devices (Clara BW/Colour, Libra Colour, Elipsa 2E)
+which use D-Bus (com.kobo.mtk.bluedroid) instead of bluetoothctl
+--]]
+
+function Bluetooth:isMTKDevice()
+    -- Check if we're on an MTK-based Kobo device
+    -- First try Device:isMTK() if available
+    if Device.isMTK and Device:isMTK() then
+        return true
+    end
+    -- Fallback: check device model
+    local model = Device.model
+    return model and self.mtk_device_models[model] ~= nil
+end
+
+function Bluetooth:getMTKDeviceName()
+    -- Get friendly name for MTK device
+    local model = Device.model
+    if model and self.mtk_device_models[model] then
+        return self.mtk_device_models[model]
+    end
+    return "MTK Device"
+end
+
+function Bluetooth:isMTKBluetoothOn()
+    -- Check if Bluetooth is powered on via D-Bus on MTK devices
+    local result = self:executeCommand(self.mtk_dbus.cmd_check_powered)
+    if result and result:match("boolean%s+true") then
+        self.is_bluetooth_on = true
+        return true
+    else
+        self.is_bluetooth_on = false
+        return false
+    end
+end
+
+function Bluetooth:turnOnMTKBluetooth()
+    -- Turn on Bluetooth on MTK devices using D-Bus
+    -- Step 1: Call BluedroidManager1.On() - this auto-starts the service
+    local result1 = self:executeCommand(self.mtk_dbus.cmd_on)
+    
+    -- Step 2: Power on the adapter
+    local result2 = self:executeCommand(self.mtk_dbus.cmd_power_on)
+    
+    -- Check if successful
+    if self:isMTKBluetoothOn() then
+        return true, "Bluetooth enabled via D-Bus"
+    else
+        return false, "Failed to enable Bluetooth via D-Bus"
+    end
+end
+
+function Bluetooth:turnOffMTKBluetooth()
+    -- Turn off Bluetooth on MTK devices using D-Bus
+    -- Step 1: Power off the adapter
+    self:executeCommand(self.mtk_dbus.cmd_power_off)
+    
+    -- Step 2: Call BluedroidManager1.Off()
+    self:executeCommand(self.mtk_dbus.cmd_off)
+    
+    -- Note: MTK devices may need a reboot before returning to Nickel
+    -- due to non-idempotent kernel driver initialization
+    return true
+end
+
+function Bluetooth:startMTKDiscovery()
+    -- Start Bluetooth discovery on MTK devices
+    local result = os.execute(self.mtk_dbus.cmd_start_discovery)
+    return result == 0
+end
+
+function Bluetooth:stopMTKDiscovery()
+    -- Stop Bluetooth discovery on MTK devices
+    local result = os.execute(self.mtk_dbus.cmd_stop_discovery)
+    return result == 0
+end
+
+function Bluetooth:getMTKManagedObjects()
+    -- Get all Bluetooth devices via D-Bus GetManagedObjects
+    local handle = io.popen(self.mtk_dbus.cmd_get_devices)
+    if not handle then
+        return nil
+    end
+    local output = handle:read("*a")
+    handle:close()
+    return output
+end
+
+function Bluetooth:parseMTKDevices(dbus_output)
+    -- Parse D-Bus GetManagedObjects output to extract device information
+    local devices = {}
+    
+    if not dbus_output or dbus_output == "" then
+        return devices
+    end
+    
+    local current_device = nil
+    local last_property = nil
+    
+    for line in dbus_output:gmatch("[^\r\n]+") do
+        -- Look for device object paths
+        local dev_path = line:match('object path "(/org/bluez/hci0/dev_[%w_]+)"')
+        
+        if dev_path then
+            -- Save previous device if exists
+            if current_device then
+                table.insert(devices, current_device)
+            end
+            
+            -- Extract MAC from path (dev_XX_XX_XX_XX_XX_XX -> XX:XX:XX:XX:XX:XX)
+            local mac_underscore = dev_path:match("dev_([%w_]+)$")
+            local mac = mac_underscore and mac_underscore:gsub("_", ":") or ""
+            
+            current_device = {
+                path = dev_path,
+                address = mac,
+                name = "",
+                paired = false,
+                connected = false,
+                trusted = false,
+                rssi = nil,
+            }
+            last_property = nil
+        elseif current_device then
+            -- Parse properties
+            if line:match('string "Address"') then
+                last_property = "Address"
+            elseif line:match('string "Name"') then
+                last_property = "Name"
+            elseif line:match('string "Paired"') then
+                last_property = "Paired"
+            elseif line:match('string "Connected"') then
+                last_property = "Connected"
+            elseif line:match('string "Trusted"') then
+                last_property = "Trusted"
+            elseif line:match('string "RSSI"') then
+                last_property = "RSSI"
+            end
+            
+            -- Extract values
+            if last_property == "Address" then
+                local addr_value = line:match('variant%s+string "([%w:]+)"')
+                if addr_value then
+                    current_device.address = addr_value
+                    last_property = nil
+                end
+            elseif last_property == "Name" then
+                local name_value = line:match('variant%s+string "([^"]*)"')
+                if name_value then
+                    current_device.name = name_value
+                    last_property = nil
+                end
+            elseif last_property == "Paired" then
+                local paired_value = line:match("variant%s+boolean (%w+)")
+                if paired_value then
+                    current_device.paired = (paired_value == "true")
+                    last_property = nil
+                end
+            elseif last_property == "Connected" then
+                local connected_value = line:match("variant%s+boolean (%w+)")
+                if connected_value then
+                    current_device.connected = (connected_value == "true")
+                    last_property = nil
+                end
+            elseif last_property == "Trusted" then
+                local trusted_value = line:match("variant%s+boolean (%w+)")
+                if trusted_value then
+                    current_device.trusted = (trusted_value == "true")
+                    last_property = nil
+                end
+            elseif last_property == "RSSI" then
+                local rssi_value = line:match("variant%s+int16%s+(-?%d+)")
+                if rssi_value then
+                    current_device.rssi = tonumber(rssi_value)
+                    last_property = nil
+                end
+            end
+        end
+    end
+    
+    -- Don't forget the last device
+    if current_device then
+        table.insert(devices, current_device)
+    end
+    
+    -- Sort by RSSI (strongest first)
+    table.sort(devices, function(a, b)
+        local rssi_a = a.rssi or -127
+        local rssi_b = b.rssi or -127
+        return rssi_a > rssi_b
+    end)
+    
+    return devices
+end
+
+function Bluetooth:connectMTKDevice(device_path)
+    -- Connect to a Bluetooth device on MTK via D-Bus
+    local cmd = string.format(
+        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s org.bluez.Device1.Connect",
+        device_path
+    )
+    local result = os.execute(cmd)
+    return result == 0
+end
+
+function Bluetooth:disconnectMTKDevice(device_path)
+    -- Disconnect from a Bluetooth device on MTK via D-Bus
+    local cmd = string.format(
+        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s org.bluez.Device1.Disconnect",
+        device_path
+    )
+    local result = os.execute(cmd)
+    return result == 0
+end
+
+function Bluetooth:trustMTKDevice(device_path, trusted)
+    -- Set/unset Trusted property on a device
+    local trust_str = trusted and "true" or "false"
+    local cmd = string.format(
+        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s "
+        .. "org.freedesktop.DBus.Properties.Set "
+        .. "string:org.bluez.Device1 string:Trusted variant:boolean:%s",
+        device_path, trust_str
+    )
+    local result = os.execute(cmd)
+    return result == 0
+end
+
+function Bluetooth:removeMTKDevice(device_path)
+    -- Remove (unpair) a Bluetooth device on MTK
+    -- First disconnect
+    self:disconnectMTKDevice(device_path)
+    
+    -- Then remove from adapter
+    local cmd = string.format(
+        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 "
+        .. "org.bluez.Adapter1.RemoveDevice objpath:%s",
+        device_path
+    )
+    local result = os.execute(cmd)
+    return result == 0
+end
+
+function Bluetooth:detectMTKBluetoothInputDevices()
+    -- Detect Bluetooth input devices on MTK by checking for 'uhid' in sysfs symlinks
+    -- MTK Bluetooth HID devices have symlinks containing 'uhid', while built-in devices use 'platform'
+    local devices = {}
+    
+    local handle = io.popen("ls -1d /sys/class/input/event* 2>/dev/null")
+    if not handle then
+        return devices
+    end
+    
+    for event_path in handle:lines() do
+        -- Check if this is a Bluetooth device by reading the symlink
+        local link_handle = io.popen("readlink " .. event_path .. " 2>/dev/null")
+        if link_handle then
+            local target = link_handle:read("*l")
+            link_handle:close()
+            
+            if target and target:match("uhid") then
+                local event_num = event_path:match("event(%d+)$")
+                if event_num then
+                    local device_path = "/dev/input/event" .. event_num
+                    
+                    -- Get device name from sysfs
+                    local name_path = string.format("/sys/class/input/event%s/device/name", event_num)
+                    local name_file = io.open(name_path, "r")
+                    local device_name = nil
+                    if name_file then
+                        device_name = name_file:read("*l")
+                        name_file:close()
+                    end
+                    
+                    table.insert(devices, {
+                        path = device_path,
+                        name = device_name,
+                        event_num = tonumber(event_num),
+                    })
+                end
+            end
+        end
+    end
+    handle:close()
+    
+    return devices
+end
+
+function Bluetooth:findMTKInputDeviceByName(device_name)
+    -- Find input device path by matching D-Bus device name with sysfs device name
+    if not device_name or device_name == "" then
+        return nil
+    end
+    
+    local bt_devices = self:detectMTKBluetoothInputDevices()
+    for _, dev in ipairs(bt_devices) do
+        if dev.name == device_name then
+            return dev.path
+        end
+    end
+    
+    return nil
 end
 
 -- Common Linux input event key codes for reference
@@ -553,7 +907,12 @@ function Bluetooth:startScan(duration)
     -- First stop any existing scan
     self:stopScan()
     
-    -- Start scan with timeout - will auto-stop after duration seconds
+    -- Check if we're on an MTK device
+    if self:isMTKDevice() then
+        return self:startMTKDiscovery()
+    end
+    
+    -- i.MX6: Start scan with timeout - will auto-stop after duration seconds
     os.execute(string.format(
         "timeout %ds bluetoothctl scan on > /dev/null 2>&1 &",
         duration
@@ -563,6 +922,11 @@ end
 
 function Bluetooth:stopScan()
     -- Stop Bluetooth scanning properly
+    if self:isMTKDevice() then
+        return self:stopMTKDiscovery()
+    end
+    
+    -- i.MX6: 
     -- 1. Kill any running bluetoothctl scan process
     os.execute("pkill -f 'bluetoothctl scan' 2>/dev/null")
     
@@ -598,7 +962,28 @@ function Bluetooth:executeCommandWithTimeout(cmd, timeout_secs)
 end
 
 function Bluetooth:getScannedDevices()
-    -- Get list of discovered devices (with timeout to prevent freeze)
+    -- Get list of discovered devices
+    if self:isMTKDevice() then
+        -- MTK: Get all devices from D-Bus
+        local dbus_output = self:getMTKManagedObjects()
+        local mtk_devices = self:parseMTKDevices(dbus_output)
+        -- Convert to our format
+        local devices = {}
+        for _, dev in ipairs(mtk_devices) do
+            table.insert(devices, {
+                mac = dev.address,
+                name = dev.name ~= "" and dev.name or dev.address,
+                path = dev.path,
+                paired = dev.paired,
+                connected = dev.connected,
+                trusted = dev.trusted,
+                rssi = dev.rssi,
+            })
+        end
+        return devices
+    end
+    
+    -- i.MX6: use bluetoothctl with timeout to prevent freeze
     local result = self:executeCommandWithTimeout("bluetoothctl devices", 3)
     local devices = {}
     
@@ -617,7 +1002,28 @@ function Bluetooth:getScannedDevices()
 end
 
 function Bluetooth:getPairedDevices()
-    -- Get list of paired devices (with timeout to prevent freeze)
+    -- Get list of paired devices
+    if self:isMTKDevice() then
+        -- MTK: Get paired devices from D-Bus
+        local dbus_output = self:getMTKManagedObjects()
+        local mtk_devices = self:parseMTKDevices(dbus_output)
+        -- Filter to paired only
+        local devices = {}
+        for _, dev in ipairs(mtk_devices) do
+            if dev.paired then
+                table.insert(devices, {
+                    mac = dev.address,
+                    name = dev.name ~= "" and dev.name or dev.address,
+                    path = dev.path,
+                    connected = dev.connected,
+                    trusted = dev.trusted,
+                })
+            end
+        end
+        return devices
+    end
+    
+    -- i.MX6: use bluetoothctl with timeout to prevent freeze
     local result = self:executeCommandWithTimeout("bluetoothctl paired-devices", 3)
     local devices = {}
     
@@ -635,8 +1041,24 @@ function Bluetooth:getPairedDevices()
     return devices
 end
 
-function Bluetooth:connectToDevice(mac)
+function Bluetooth:connectToDevice(mac, device_path)
     -- Connect to a specific device by MAC address
+    if self:isMTKDevice() then
+        -- MTK: use D-Bus to connect
+        -- If device_path not provided, construct it from MAC
+        if not device_path then
+            local mac_underscore = mac:gsub(":", "_")
+            device_path = "/org/bluez/hci0/dev_" .. mac_underscore
+        end
+        local success = self:connectMTKDevice(device_path)
+        if success then
+            return true, "Connected via D-Bus"
+        else
+            return false, "D-Bus connection failed"
+        end
+    end
+    
+    -- i.MX6: use bluetoothctl
     local result = self:executeCommand("timeout 5s bluetoothctl connect " .. mac)
     local success = result:match("Connection successful") ~= nil
     return success, result
@@ -2055,14 +2477,22 @@ function Bluetooth:checkDeviceType()
         return false, nil, info
     end
     
-    -- Check if it's a supported model
+    -- Check if it's a supported i.MX6 model
     local friendly_name = self.supported_devices[info.model]
-    
     if friendly_name then
+        info.device_type = "i.MX6"
         return true, friendly_name, info
-    else
-        return false, nil, info
     end
+    
+    -- Check if it's a supported MTK model
+    local mtk_name = self.mtk_device_models[info.model]
+    if mtk_name then
+        info.device_type = "MTK"
+        info.isMTK = true
+        return true, mtk_name, info
+    end
+    
+    return false, nil, info
 end
 
 function Bluetooth:getActualKoreaderPath()
@@ -2138,7 +2568,37 @@ end
 
 function Bluetooth:getInputDevicePath()
     -- Determine the correct input device path
-    -- Priority: 1) Match by Bluetooth device name, 2) Known device model, 3) Highest event, 4) Default
+    -- Priority for MTK: 1) uhid detection, 2) Name match, 3) Known model, 4) Highest event
+    -- Priority for i.MX6: 1) BT name match, 2) Known model, 3) Highest event, 4) Default
+    
+    -- On MTK devices, try uhid detection first (most reliable)
+    if self:isMTKDevice() then
+        local bt_devices = self:detectMTKBluetoothInputDevices()
+        if #bt_devices > 0 then
+            -- If only one device, use it directly
+            if #bt_devices == 1 then
+                return bt_devices[1].path, true, "mtk_uhid_auto", bt_devices[1].name
+            end
+            -- Multiple devices: try to match by saved device name
+            local saved_mac, saved_name = self:getSavedDeviceMAC()
+            if saved_name then
+                for _, dev in ipairs(bt_devices) do
+                    if dev.name == saved_name then
+                        return dev.path, true, "mtk_uhid_name_match", dev.name
+                    end
+                end
+            end
+            -- Fallback to highest event among detected
+            local highest = bt_devices[1]
+            for _, dev in ipairs(bt_devices) do
+                if dev.event_num > highest.event_num then
+                    highest = dev
+                end
+            end
+            return highest.path, false, "mtk_uhid_highest", highest.name
+        end
+        -- No uhid devices found, fall through to other methods
+    end
     
     -- First try: match by saved Bluetooth device name
     local matched_path, matched_name, match_type = self:findInputDeviceByBluetoothName()
@@ -2276,9 +2736,33 @@ function Bluetooth:getDiagnosticsMenu()
         callback = function()
             -- Re-check when clicked
             local is_on = self:isBluetoothOn()
-            local hci_output = self:executeCommand("hciconfig hci0 2>&1")
-            self:popup((is_on and _("✓ Bluetooth is currently ON\n\n") or _("✗ Bluetooth is currently OFF\n\n")) ..
-                _("HCI interface status:\n") .. (hci_output or "(no output)"), 10)
+            local status_info = ""
+            
+            if self:isMTKDevice() then
+                -- MTK: show D-Bus status
+                status_info = _("Device type: MTK (") .. self:getMTKDeviceName() .. ")\n"
+                status_info = status_info .. _("Control method: D-Bus (com.kobo.mtk.bluedroid)\n\n")
+                
+                -- Show D-Bus service status
+                local dbus_check = self:executeCommand("dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1 | grep -q 'com.kobo.mtk.bluedroid' && echo 'Service active' || echo 'Service not found'")
+                status_info = status_info .. _("D-Bus service: ") .. (dbus_check or "unknown") .. "\n"
+                
+                -- Check mtkbtd/btservice processes
+                local processes = self:executeCommand("ps aux | grep -E '(mtkbtd|btservice)' | grep -v grep")
+                if processes and processes ~= "" then
+                    status_info = status_info .. _("\nBluetooth processes running:\n") .. processes
+                else
+                    status_info = status_info .. _("\nNo Bluetooth processes detected")
+                end
+            else
+                -- i.MX6: show HCI status
+                status_info = _("Device type: i.MX6\n")
+                status_info = status_info .. _("Control method: bluetoothctl/hciattach\n\n")
+                local hci_output = self:executeCommand("hciconfig hci0 2>&1")
+                status_info = status_info .. _("HCI interface status:\n") .. (hci_output or "(no output)")
+            end
+            
+            self:popup((is_on and _("✓ Bluetooth is currently ON\n\n") or _("✗ Bluetooth is currently OFF\n\n")) .. status_info, 10)
         end,
     })
     
@@ -2306,29 +2790,41 @@ function Bluetooth:getDiagnosticsMenu()
         text = device_icon .. _("Device type"),
         callback = function()
             -- Build device info string for display
+            -- Re-check for fresh info
+            local fresh_device_ok, fresh_friendly_name, fresh_device_info = self:checkDeviceType()
+            local is_mtk = self:isMTKDevice()
+            
             local info_str = _("Detected device info:\n") ..
-                _("  Model: ") .. device_info.model .. "\n" ..
-                _("  isKobo: ") .. tostring(device_info.isKobo) .. "\n" ..
-                _("  isEmulator: ") .. tostring(device_info.isEmulator) .. "\n" ..
-                _("  isSDL: ") .. tostring(device_info.isSDL)
+                _("  Model: ") .. fresh_device_info.model .. "\n" ..
+                _("  isKobo: ") .. tostring(fresh_device_info.isKobo) .. "\n" ..
+                _("  isMTK: ") .. tostring(is_mtk) .. "\n" ..
+                _("  isEmulator: ") .. tostring(fresh_device_info.isEmulator) .. "\n" ..
+                _("  isSDL: ") .. tostring(fresh_device_info.isSDL)
+            
+            device_ok = fresh_device_ok
+            friendly_name = fresh_friendly_name
+            device_info = fresh_device_info
             
             if device_ok then
-                self:popup(_("✓ Supported device detected:\n") .. friendly_name .. "\n(" .. device_info.model .. ")\n\n" .. info_str, 7)
+                local device_type_str = device_info.device_type and (" [" .. device_info.device_type .. "]") or ""
+                self:popup(_("✓ Supported device detected:\n") .. friendly_name .. device_type_str .. "\n(" .. device_info.model .. ")\n\n" .. info_str, 7)
             else
                 local msg
                 if not device_info.isKobo then
                     msg = _("✗ This is not a Kobo device!\n\n") ..
                         info_str .. "\n\n" ..
-                        _("This plugin only supports Kobo devices.\n\n") ..
-                        _("Supported devices:\n") ..
-                        _("• Kobo Libra 2\n") ..
-                        _("• Kobo Clara 2E")
+                        _("This plugin only supports Kobo devices.")
                 else
                     msg = _("✗ Unsupported Kobo model!\n\n") ..
                         info_str .. "\n\n" ..
-                        _("Supported devices:\n") ..
+                        _("Supported i.MX6 devices:\n") ..
                         _("• Kobo Libra 2 (Kobo_io)\n") ..
                         _("• Kobo Clara 2E (Kobo_goldfinch)\n\n") ..
+                        _("Supported MTK devices:\n") ..
+                        _("• Kobo Elipsa 2E (Kobo_condor)\n") ..
+                        _("• Kobo Libra Colour (Kobo_monza)\n") ..
+                        _("• Kobo Clara BW (Kobo_spaBW)\n") ..
+                        _("• Kobo Clara Colour (Kobo_spaColour)\n\n") ..
                         _("Corrective action:\n") ..
                         _("This plugin may still work if your device has compatible Bluetooth hardware. Check the 'Bluetooth commands' diagnostic to see if binaries were auto-detected.")
                 end
@@ -2375,10 +2871,8 @@ function Bluetooth:getDiagnosticsMenu()
     local current_path, path_is_known, path_method, path_extra = self:getInputDevicePath()
     local model = Device.model or "unknown"
     local path_icon
-    if path_method == "bt_name_match" then
-        path_icon = "✓ "  -- Best: matched by BT device name
-    elseif path_method == "device_model" then
-        path_icon = "✓ "  -- Good: known device model
+    if path_method:match("^mtk_uhid") or path_method == "bt_name_match" or path_method == "device_model" then
+        path_icon = "✓ "  -- Good detection
     else
         path_icon = "⚠ "  -- Warning: guessing
     end
@@ -2390,7 +2884,23 @@ function Bluetooth:getDiagnosticsMenu()
             local p, known, method, extra = self:getInputDevicePath()
             local msg
             
-            if method == "bt_name_match" then
+            if method == "mtk_uhid_auto" then
+                msg = _("✓ MTK: Single Bluetooth HID device detected!\n\n") ..
+                    _("This is the most reliable detection on MTK devices.\n\n") ..
+                    _("Device: ") .. (extra or "?") .. "\n" ..
+                    _("Path: ") .. p .. "\n\n" ..
+                    _("The device was found in /sys/class/input/ with 'uhid' in its path.")
+            elseif method == "mtk_uhid_name_match" then
+                msg = _("✓ MTK: Matched by device name!\n\n") ..
+                    _("Device: ") .. (extra or "?") .. "\n" ..
+                    _("Path: ") .. p .. "\n\n" ..
+                    _("Multiple Bluetooth devices detected; matched by saved device name.")
+            elseif method == "mtk_uhid_highest" then
+                msg = _("⚠ MTK: Using highest of multiple devices.\n\n") ..
+                    _("Device: ") .. (extra or "?") .. "\n" ..
+                    _("Path: ") .. p .. "\n\n" ..
+                    _("Multiple Bluetooth devices detected but no name match. Using highest event number.")
+            elseif method == "bt_name_match" then
                 msg = _("✓ Input device matched by Bluetooth name!\n\n") ..
                     _("This is the most reliable detection method.\n\n") ..
                     _("Bluetooth device: ") .. (extra or "?") .. "\n" ..
@@ -2411,6 +2921,17 @@ function Bluetooth:getDiagnosticsMenu()
                 msg = _("⚠ Using default input device path!\n\n") ..
                     _("Path: ") .. p .. "\n\n" ..
                     _("Could not detect the correct input device. Using fallback.")
+            end
+            
+            -- For MTK devices, also show all detected uhid devices
+            if self:isMTKDevice() then
+                local bt_devices = self:detectMTKBluetoothInputDevices()
+                if #bt_devices > 0 then
+                    msg = msg .. "\n\n" .. _("── All detected Bluetooth HID devices ──")
+                    for _, dev in ipairs(bt_devices) do
+                        msg = msg .. "\n" .. dev.path .. ": " .. (dev.name or "unnamed")
+                    end
+                end
             end
             
             self:popup(msg, 10)
@@ -3257,7 +3778,13 @@ function Bluetooth:executeCommand(cmd)
 end
 
 function Bluetooth:turnOnBluetoothCommands()
-    -- Get device-specific Bluetooth config
+    -- Check if we're on an MTK device - use D-Bus instead of hciattach
+    if self:isMTKDevice() then
+        local success, msg = self:turnOnMTKBluetooth()
+        return msg or (success and "MTK Bluetooth enabled" or "MTK Bluetooth failed")
+    end
+    
+    -- i.MX6 devices: use traditional hciattach method
     local bt_config, _ = self:getBluetoothConfig()
     local plugin_path = self.path
     local results = {}
@@ -3330,7 +3857,15 @@ function Bluetooth:onBluetoothOff()
 end
 
 function Bluetooth:turnOffBluetooth()
-    -- Get device-specific Bluetooth config
+    -- Check if we're on an MTK device - use D-Bus instead
+    if self:isMTKDevice() then
+        self:turnOffMTKBluetooth()
+        -- Note: MTK devices may need a reboot before returning to Nickel
+        -- due to non-idempotent kernel driver initialization
+        return
+    end
+    
+    -- i.MX6 devices: use traditional method
     local bt_config, _ = self:getBluetoothConfig()
     local plugin_path = self.path
     
