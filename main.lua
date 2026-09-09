@@ -538,14 +538,40 @@ function Bluetooth:parseMTKDevices(dbus_output)
     return devices
 end
 
+function Bluetooth:isMTKDeviceConnected(device_path)
+    -- Treat an already connected device as a successful connection request.
+    local cmd = string.format(
+        "dbus-send --system --print-reply --dest=%s %s "
+        .. "org.freedesktop.DBus.Properties.Get "
+        .. "string:org.bluez.Device1 string:Connected",
+        self.mtk_dbus.dest, device_path
+    )
+    local result = self:executeCommand(cmd)
+    return result and result:match("boolean%s+true") ~= nil
+end
+
 function Bluetooth:connectMTKDevice(device_path)
     -- Connect to a Bluetooth device on MTK via D-Bus
+    -- Device1.Connect returns AlreadyConnected when the desired state is already true.
+    if self:isMTKDeviceConnected(device_path) then
+        return true, "Already connected via D-Bus"
+    end
+
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s org.bluez.Device1.Connect",
-        device_path
+        "dbus-send --system --print-reply --dest=%s %s org.bluez.Device1.Connect",
+        self.mtk_dbus.dest, device_path
     )
-    local result = os.execute(cmd)
-    return result == 0
+    local result = self:executeCommand(cmd)
+
+    -- A concurrent connection can make the state change after the check above.
+    if result and result:match("org%.bluez%.Error%.AlreadyConnected") then
+        return true, "Already connected via D-Bus"
+    end
+    if result and result:match("^method return") then
+        return true, "Connected via D-Bus"
+    end
+
+    return false, result
 end
 
 function Bluetooth:disconnectMTKDevice(device_path)
@@ -1050,11 +1076,11 @@ function Bluetooth:connectToDevice(mac, device_path)
             local mac_underscore = mac:gsub(":", "_")
             device_path = "/org/bluez/hci0/dev_" .. mac_underscore
         end
-        local success = self:connectMTKDevice(device_path)
+        local success, result = self:connectMTKDevice(device_path)
         if success then
-            return true, "Connected via D-Bus"
+            return true, result or "Connected via D-Bus"
         else
-            return false, "D-Bus connection failed"
+            return false, result or "D-Bus connection failed"
         end
     end
     
