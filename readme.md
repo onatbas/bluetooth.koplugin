@@ -58,9 +58,9 @@ MTK Bluetooth support made possible by the excellent investigation and documenta
 
 In KOReader, go to **☰ → Network → Bluetooth → Diagnostics**
 
-Click any item marked with ✗ and choose **"Correct Automatically"**:
-- **hasKeys flag** - Required for button input to work
-- **Event map** - Default button mappings for 8BitDo controllers
+Click any item marked with ✗ and choose the appropriate correction:
+- **hasKeys flag** - Choose **"Correct Automatically"**; this is required for button input to work
+- **Event map** - Choose **"Choose Default Profile"** and select an 8BitDo Micro or tolino flip remote
 
 ### Step 3: Turn On Bluetooth & Pair Your Controller
 
@@ -124,6 +124,15 @@ Everything is automatic:
 - ✅ Input device path (event3/event4)
 - ✅ Button mappings
 - ✅ hasKeys override
+
+### Default Mapping Profiles
+
+The plugin provides two selectable default mapping profiles. Open **Bluetooth → Event Map Editor → Choose default mapping profile**:
+
+- **8BitDo Micro** - the full keyboard-mode mapping for the 8BitDo Micro
+- **tolino flip remote** - `103 → BTLeft` (previous page) and `108 → BTRight` (next page)
+
+Applying a profile replaces the current Bluetooth event mappings and persists the selection in `settings/event_map.lua`. Custom mappings can still be created with the Event Map Editor or Guided Simple Setup.
 
 ### Device Management
 Scan, select, and save Bluetooth devices directly from the UI. No more editing scripts!

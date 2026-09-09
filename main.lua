@@ -129,27 +129,49 @@ Bluetooth.mtk_dbus = {
         .. 'org.freedesktop.DBus.ObjectManager.GetManagedObjects',
 }
 
--- Default BTAction key mappings for 8BitDo controller
--- These will be written to settings/event_map.lua if auto-correction is used
-Bluetooth.default_event_mappings = {
-    [19]  = "BTAction1",   -- R
-    [23]  = "BTAction2",   -- I
-    [25]  = "BTAction3",   -- P/Y
-    [32]  = "BTAction4",   -- D/R2
-    [38]  = "BTAction5",   -- L/L2
-    [45]  = "BTAction6",   -- X
-    [46]  = "BTAction7",   -- C/B
-    [48]  = "BTAction8",   -- B/UP
-    [49]  = "BTAction9",   -- N/A
-    [60]  = "BTAction15",  -- F2 (bank switch)
-    [61]  = "BTAction16",  -- F3 (bank switch)
-    [103] = "BTAction10",  -- Up arrow
-    [105] = "BTAction11",  -- Left arrow
-    [106] = "BTAction12",  -- Right arrow
-    [108] = "BTAction13",  -- Down arrow
-    [109] = "BTAction14",  -- Page Down
-    [115] = "BTLeft",      -- Additional button
+-- Default event mapping profiles
+-- These mappings can be applied from the Event Map Editor and are written to
+-- settings/event_map.lua so the selected profile persists across restarts.
+Bluetooth.default_event_mapping_profiles = {
+    ["8bitdo_micro"] = {
+        name = "8BitDo Micro",
+        mappings = {
+            [19]  = "BTAction1",   -- R
+            [23]  = "BTAction2",   -- I
+            [25]  = "BTAction3",   -- P/Y
+            [32]  = "BTAction4",   -- D/R2
+            [38]  = "BTAction5",   -- L/L2
+            [45]  = "BTAction6",   -- X
+            [46]  = "BTAction7",   -- C/B
+            [48]  = "BTAction8",   -- B/UP
+            [49]  = "BTAction9",   -- N/A
+            [60]  = "BTAction15",  -- F2 (bank switch)
+            [61]  = "BTAction16",  -- F3 (bank switch)
+            [103] = "BTAction10",  -- Up arrow
+            [105] = "BTAction11",  -- Left arrow
+            [106] = "BTAction12",  -- Right arrow
+            [108] = "BTAction13",  -- Down arrow
+            [109] = "BTAction14",  -- Page Down
+            [115] = "BTLeft",      -- Additional button
+        },
+    },
+    ["tolino_flip"] = {
+        name = "tolino flip remote",
+        mappings = {
+            [103] = "BTLeft",  -- KEY_UP: previous page
+            [108] = "BTRight", -- KEY_DOWN: next page
+        },
+    },
 }
+
+Bluetooth.default_event_mapping_profile_order = {
+    "8bitdo_micro",
+    "tolino_flip",
+}
+
+-- Keep the 8BitDo profile as the fallback for code paths that need a default
+-- mapping without an explicitly selected profile.
+Bluetooth.default_event_mappings = Bluetooth.default_event_mapping_profiles["8bitdo_micro"].mappings
 
 -- Config file for storing Bluetooth device settings
 Bluetooth.config_file = "bt_config.lua"
@@ -1829,6 +1851,99 @@ function Bluetooth:saveEventMap(mappings)
     return true, path
 end
 
+function Bluetooth:applyDefaultEventMappingProfile(profile_id)
+    local profile = self.default_event_mapping_profiles[profile_id]
+    if not profile then
+        return false, "Unknown default mapping profile: " .. tostring(profile_id)
+    end
+
+    local success, result = self:autoCorrectEventMap(profile.mappings)
+    if not success then
+        return false, result
+    end
+
+    return true, string.format(
+        _("Applied default mapping profile: %s"), profile.name
+    ) .. "\n\n" .. result
+end
+
+function Bluetooth:confirmDefaultEventMappingProfile(profile_id)
+    local profile = self.default_event_mapping_profiles[profile_id]
+    if not profile then
+        self:popup("Unknown default mapping profile: " .. tostring(profile_id), 5)
+        return
+    end
+
+    local lines = {
+        string.format(_("Apply the default mappings for %s?"), profile.name),
+        "",
+        _("This replaces all current Bluetooth event mappings."),
+        "",
+        _("Mappings:"),
+    }
+    local codes = {}
+    for code, _ in pairs(profile.mappings) do
+        table.insert(codes, code)
+    end
+    table.sort(codes)
+    for _, code in ipairs(codes) do
+        table.insert(lines, string.format("  [%d] → %s", code, profile.mappings[code]))
+    end
+
+    UIManager:show(ConfirmBox:new{
+        text = table.concat(lines, "\n"),
+        ok_text = _("Apply"),
+        ok_callback = function()
+            local success, result = self:applyDefaultEventMappingProfile(profile_id)
+            if success then
+                self:popup(_("✓ ") .. result, 8)
+            else
+                self:popup(_("✗ Failed to apply default mappings:\n") .. result, 8)
+            end
+        end,
+        cancel_text = _("Cancel"),
+    })
+end
+
+function Bluetooth:showDefaultMappingProfiles()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local buttons = {}
+
+    local function addProfileButton(profile_id, profile)
+        table.insert(buttons, {
+            {
+                text = profile.name,
+                callback = function()
+                    UIManager:close(self._default_mapping_profiles_dialog)
+                    self:confirmDefaultEventMappingProfile(profile_id)
+                end,
+            },
+        })
+    end
+
+    for _, profile_id in ipairs(self.default_event_mapping_profile_order) do
+        local profile = self.default_event_mapping_profiles[profile_id]
+        if profile then
+            addProfileButton(profile_id, profile)
+        end
+    end
+
+    table.insert(buttons, {
+        {
+            text = _("Cancel"),
+            callback = function()
+                UIManager:close(self._default_mapping_profiles_dialog)
+            end,
+        },
+    })
+
+    self._default_mapping_profiles_dialog = ButtonDialog:new{
+        title = _("Choose a default mapping profile"),
+        buttons = buttons,
+    }
+    UIManager:show(self._default_mapping_profiles_dialog)
+end
+
 function Bluetooth:getEventMapEditorMenu()
     local menu = {}
     local mappings = self:getCurrentEventMap()
@@ -1885,6 +2000,14 @@ function Bluetooth:getEventMapEditorMenu()
         end,
     })
     
+    -- Choose a default mapping profile
+    table.insert(menu, {
+        text = _("📋 Choose default mapping profile"),
+        callback = function()
+            self:showDefaultMappingProfiles()
+        end,
+    })
+
     -- Reload from file
     table.insert(menu, {
         text = _("🔄 Reload from file"),
@@ -3085,15 +3208,10 @@ function Bluetooth:getDiagnosticsMenu()
                         },
                         {
                             {
-                                text = _("Advanced Default"),
+                                text = _("Choose Default Profile"),
                                 callback = function()
                                     UIManager:close(button_dialog)
-                                    local success, result = self:autoCorrectEventMap()
-                                    if success then
-                                        self:popup(_("✓ ") .. result, 7)
-                                    else
-                                        self:popup(_("✗ Auto-correction failed:\n") .. result, 7)
-                                    end
+                                    self:showDefaultMappingProfiles()
                                 end,
                             },
                         },
@@ -3651,9 +3769,18 @@ function Bluetooth:writeCustomEventMap(mappings)
     file:write("}\n")
     file:close()
     
-    -- Also inject into current session
+    -- Replace BT mappings in the current session as well
     local event_map = Device.input and Device.input.event_map
     if event_map then
+        local old_codes = {}
+        for code, name in pairs(event_map) do
+            if type(name) == "string" and name:match("^BT") then
+                table.insert(old_codes, code)
+            end
+        end
+        for _, code in ipairs(old_codes) do
+            event_map[code] = nil
+        end
         for code, name in pairs(mappings_to_write) do
             event_map[code] = name
         end
@@ -3687,31 +3814,43 @@ function Bluetooth:deleteEventMappings()
     return true
 end
 
-function Bluetooth:injectEventMappings()
-    -- Inject BTAction mappings into Device.input.event_map at runtime
+function Bluetooth:injectEventMappings(mappings)
+    -- Inject the selected mappings into Device.input.event_map at runtime
     local event_map = Device.input and Device.input.event_map
     if not event_map then
         return false, "event_map not accessible"
     end
-    
+
+    local mappings_to_inject = mappings or self.default_event_mappings
+    local old_codes = {}
+    for code, name in pairs(event_map) do
+        if type(name) == "string" and name:match("^BT") then
+            table.insert(old_codes, code)
+        end
+    end
+    for _, code in ipairs(old_codes) do
+        event_map[code] = nil
+    end
+
     local count = 0
-    for key, value in pairs(self.default_event_mappings) do
+    for key, value in pairs(mappings_to_inject) do
         event_map[key] = value
         count = count + 1
     end
-    
+
     return true, count
 end
 
-function Bluetooth:autoCorrectEventMap()
+function Bluetooth:autoCorrectEventMap(mappings)
     -- Step 1: Write the custom event_map.lua file (persists across restarts)
-    local write_ok, write_result = self:writeCustomEventMap()
+    local mappings_to_apply = mappings or self.default_event_mappings
+    local write_ok, write_result = self:writeCustomEventMap(mappings_to_apply)
     if not write_ok then
         return false, write_result
     end
     
     -- Step 2: Inject mappings into current session (immediate effect)
-    local inject_ok, inject_result = self:injectEventMappings()
+    local inject_ok, inject_result = self:injectEventMappings(mappings_to_apply)
     if not inject_ok then
         return true, "File written to " .. write_result .. " but runtime injection failed: " .. inject_result .. "\n\nPlease restart KOReader for changes to take effect."
     end
