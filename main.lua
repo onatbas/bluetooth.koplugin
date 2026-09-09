@@ -116,7 +116,7 @@ Bluetooth.mtk_dbus = {
     -- Check if Bluetooth is powered
     cmd_check_powered = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
         .. 'org.freedesktop.DBus.Properties.Get '
-        .. 'string:org.bluez.Adapter1 string:Powered 2>/dev/null',
+        .. 'string:org.bluez.Adapter1 string:Powered',
     
     -- Start/stop discovery
     cmd_start_discovery = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
@@ -389,67 +389,160 @@ function Bluetooth:getMTKDeviceName()
     return "MTK Device"
 end
 
+function Bluetooth:executeDBusCommand(operation, command)
+    -- LuaJIT's io.popen():close() does not expose the child exit status on Kobo.
+    -- Append a shell marker so errors and their exit status can be reported together.
+    local status_marker = "__BLUETOOTH_DBUS_EXIT_STATUS__="
+    local handle = io.popen(
+        command .. " 2>&1; printf '\\n" .. status_marker .. "%s\\n' \"$?\""
+    )
+    if not handle then
+        return false, operation .. " failed: could not start D-Bus command"
+    end
+
+    local raw_output = handle:read("*a") or ""
+    handle:close()
+
+    local marker_start = raw_output:find("\n" .. status_marker, 1, true)
+    if not marker_start then
+        local output = raw_output:gsub("^%s+", ""):gsub("%s+$", "")
+        if output == "" then
+            output = "(no output)"
+        end
+        return false, operation .. " failed: could not determine exit status.\nOutput: " .. output, raw_output
+    end
+
+    local output = raw_output:sub(1, marker_start - 1)
+    output = output:gsub("^%s+", ""):gsub("%s+$", "")
+    local status = tonumber(raw_output:match(status_marker .. "(%d+)", marker_start + 1))
+    if not status then
+        if output == "" then
+            output = "(no output)"
+        end
+        return false, operation .. " failed: could not parse exit status.\nOutput: " .. output, output
+    end
+
+    local has_dbus_error = output:match("^Error [%w%._]+:") or output:match("\nError [%w%._]+:")
+    if status ~= 0 or has_dbus_error then
+        local error_output = output ~= "" and output or "(no D-Bus error output)"
+        local status_detail = status ~= 0
+            and string.format("exit status %d", status)
+            or "D-Bus returned an error reply"
+        return false, string.format(
+            "%s failed (%s):\n%s", operation, status_detail, error_output
+        ), output, status
+    end
+
+    if output == "" then
+        return true, operation .. " completed without reply output.", output, status
+    end
+    return true, output, output, status
+end
+
 function Bluetooth:isMTKBluetoothOn()
     -- Check if Bluetooth is powered on via D-Bus on MTK devices
-    local result = self:executeCommand(self.mtk_dbus.cmd_check_powered)
-    if result and result:match("boolean%s+true") then
+    local success, detail, output = self:executeDBusCommand(
+        "Read org.bluez.Adapter1.Powered from /org/bluez/hci0", self.mtk_dbus.cmd_check_powered
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+
+    if success and output and output:match("boolean%s+true") then
         self.is_bluetooth_on = true
-        return true
-    else
-        self.is_bluetooth_on = false
-        return false
+        return true, detail
     end
+
+    self.is_bluetooth_on = false
+    return false, detail
 end
 
 function Bluetooth:turnOnMTKBluetooth()
     -- Turn on Bluetooth on MTK devices using D-Bus
+    local details = {}
+
     -- Step 1: Call BluedroidManager1.On() - this auto-starts the service
-    local result1 = self:executeCommand(self.mtk_dbus.cmd_on)
-    
+    local on_ok, on_detail = self:executeDBusCommand(
+        "Call " .. self.mtk_dbus.dest .. ".com.kobo.bluetooth.BluedroidManager1.On()",
+        self.mtk_dbus.cmd_on
+    )
+    table.insert(details, on_detail)
+
     -- Step 2: Power on the adapter
-    local result2 = self:executeCommand(self.mtk_dbus.cmd_power_on)
-    
-    -- Check if successful
-    if self:isMTKBluetoothOn() then
+    local power_ok, power_detail = self:executeDBusCommand(
+        "Set org.bluez.Adapter1.Powered=true on /org/bluez/hci0",
+        self.mtk_dbus.cmd_power_on
+    )
+    table.insert(details, power_detail)
+
+    -- Verify the final state, even if one of the setup calls reported an error.
+    local powered, state_detail = self:isMTKBluetoothOn()
+    if powered then
         return true, "Bluetooth enabled via D-Bus"
-    else
-        return false, "Failed to enable Bluetooth via D-Bus"
     end
+
+    if self.mtk_dbus_last_error then
+        table.insert(details, self.mtk_dbus_last_error)
+    else
+        table.insert(details, "Read org.bluez.Adapter1.Powered returned false:\n" .. (state_detail or "(no reply output)"))
+    end
+    return false, table.concat(details, "\n\n")
 end
 
 function Bluetooth:turnOffMTKBluetooth()
     -- Turn off Bluetooth on MTK devices using D-Bus
+    local details = {}
+
     -- Step 1: Power off the adapter
-    self:executeCommand(self.mtk_dbus.cmd_power_off)
-    
+    local power_ok, power_detail = self:executeDBusCommand(
+        "Set org.bluez.Adapter1.Powered=false on /org/bluez/hci0",
+        self.mtk_dbus.cmd_power_off
+    )
+    table.insert(details, power_detail)
+
     -- Step 2: Call BluedroidManager1.Off()
-    self:executeCommand(self.mtk_dbus.cmd_off)
-    
+    local off_ok, off_detail = self:executeDBusCommand(
+        "Call " .. self.mtk_dbus.dest .. ".com.kobo.bluetooth.BluedroidManager1.Off()",
+        self.mtk_dbus.cmd_off
+    )
+    table.insert(details, off_detail)
+
     -- Note: MTK devices may need a reboot before returning to Nickel
     -- due to non-idempotent kernel driver initialization
-    return true
+    if power_ok and off_ok then
+        return true, "Bluetooth disabled via D-Bus"
+    end
+    return false, table.concat(details, "\n\n")
 end
 
 function Bluetooth:startMTKDiscovery()
     -- Start Bluetooth discovery on MTK devices
-    local result = os.execute(self.mtk_dbus.cmd_start_discovery)
-    return result == 0
+    local success, detail = self:executeDBusCommand(
+        "Call org.bluez.Adapter1.StartDiscovery on /org/bluez/hci0",
+        self.mtk_dbus.cmd_start_discovery
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    return success, detail
 end
 
 function Bluetooth:stopMTKDiscovery()
     -- Stop Bluetooth discovery on MTK devices
-    local result = os.execute(self.mtk_dbus.cmd_stop_discovery)
-    return result == 0
+    local success, detail = self:executeDBusCommand(
+        "Call org.bluez.Adapter1.StopDiscovery on /org/bluez/hci0",
+        self.mtk_dbus.cmd_stop_discovery
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    return success, detail
 end
 
 function Bluetooth:getMTKManagedObjects()
     -- Get all Bluetooth devices via D-Bus GetManagedObjects
-    local handle = io.popen(self.mtk_dbus.cmd_get_devices)
-    if not handle then
-        return nil
+    local success, detail, output = self:executeDBusCommand(
+        "Call org.freedesktop.DBus.ObjectManager.GetManagedObjects on " .. self.mtk_dbus.dest,
+        self.mtk_dbus.cmd_get_devices
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    if not success then
+        return nil, detail
     end
-    local output = handle:read("*a")
-    handle:close()
     return output
 end
 
@@ -568,14 +661,21 @@ function Bluetooth:isMTKDeviceConnected(device_path)
         .. "string:org.bluez.Device1 string:Connected",
         self.mtk_dbus.dest, device_path
     )
-    local result = self:executeCommand(cmd)
-    return result and result:match("boolean%s+true") ~= nil
+    local success, detail, output = self:executeDBusCommand(
+        "Read org.bluez.Device1.Connected from " .. device_path, cmd
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    if not success then
+        return false, detail
+    end
+    return output and output:match("boolean%s+true") ~= nil
 end
 
 function Bluetooth:connectMTKDevice(device_path)
     -- Connect to a Bluetooth device on MTK via D-Bus
     -- Device1.Connect returns AlreadyConnected when the desired state is already true.
-    if self:isMTKDeviceConnected(device_path) then
+    local connected, state_error = self:isMTKDeviceConnected(device_path)
+    if connected then
         return true, "Already connected via D-Bus"
     end
 
@@ -583,55 +683,80 @@ function Bluetooth:connectMTKDevice(device_path)
         "dbus-send --system --print-reply --dest=%s %s org.bluez.Device1.Connect",
         self.mtk_dbus.dest, device_path
     )
-    local result = self:executeCommand(cmd)
+    local success, detail, output = self:executeDBusCommand(
+        "Call org.bluez.Device1.Connect on " .. device_path, cmd
+    )
 
-    -- A concurrent connection can make the state change after the check above.
-    if result and result:match("org%.bluez%.Error%.AlreadyConnected") then
-        return true, "Already connected via D-Bus"
-    end
-    if result and result:match("^method return") then
+    if success then
+        self.mtk_dbus_last_error = nil
         return true, "Connected via D-Bus"
     end
 
-    return false, result
+    -- A concurrent connection can make the state change after the check above.
+    if output and output:match("org%.bluez%.Error%.AlreadyConnected") then
+        self.mtk_dbus_last_error = nil
+        return true, "Already connected via D-Bus"
+    end
+
+    if state_error then
+        detail = state_error .. "\n\n" .. (detail or "D-Bus connection failed")
+    end
+    return false, detail or "D-Bus connection failed"
 end
 
 function Bluetooth:disconnectMTKDevice(device_path)
     -- Disconnect from a Bluetooth device on MTK via D-Bus
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s org.bluez.Device1.Disconnect",
-        device_path
+        "dbus-send --system --print-reply --dest=%s %s org.bluez.Device1.Disconnect",
+        self.mtk_dbus.dest, device_path
     )
-    local result = os.execute(cmd)
-    return result == 0
+    return self:executeDBusCommand(
+        "Call org.bluez.Device1.Disconnect on " .. device_path, cmd
+    )
 end
 
 function Bluetooth:trustMTKDevice(device_path, trusted)
     -- Set/unset Trusted property on a device
     local trust_str = trusted and "true" or "false"
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s "
+        "dbus-send --system --print-reply --dest=%s %s "
         .. "org.freedesktop.DBus.Properties.Set "
         .. "string:org.bluez.Device1 string:Trusted variant:boolean:%s",
-        device_path, trust_str
+        self.mtk_dbus.dest, device_path, trust_str
     )
-    local result = os.execute(cmd)
-    return result == 0
+    return self:executeDBusCommand(
+        "Set org.bluez.Device1.Trusted=" .. trust_str .. " on " .. device_path,
+        cmd
+    )
 end
 
 function Bluetooth:removeMTKDevice(device_path)
     -- Remove (unpair) a Bluetooth device on MTK
-    -- First disconnect
-    self:disconnectMTKDevice(device_path)
-    
+    -- First disconnect, but continue if that operation fails (for example when
+    -- the device is already disconnected).
+    local disconnect_ok, disconnect_detail = self:disconnectMTKDevice(device_path)
+
     -- Then remove from adapter
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 "
+        "dbus-send --system --print-reply --dest=%s /org/bluez/hci0 "
         .. "org.bluez.Adapter1.RemoveDevice objpath:%s",
-        device_path
+        self.mtk_dbus.dest, device_path
     )
-    local result = os.execute(cmd)
-    return result == 0
+    local remove_ok, remove_detail = self:executeDBusCommand(
+        "Call org.bluez.Adapter1.RemoveDevice for " .. device_path, cmd
+    )
+
+    if remove_ok then
+        if disconnect_ok then
+            return true, remove_detail
+        end
+        return true, "Device removed, but disconnect failed:\n\n" .. disconnect_detail
+    end
+
+    if not disconnect_ok then
+        return false, disconnect_detail .. "\n\n" .. remove_detail
+    end
+    return false, remove_detail
 end
 
 function Bluetooth:detectMTKBluetoothInputDevices()
@@ -1013,7 +1138,10 @@ function Bluetooth:getScannedDevices()
     -- Get list of discovered devices
     if self:isMTKDevice() then
         -- MTK: Get all devices from D-Bus
-        local dbus_output = self:getMTKManagedObjects()
+        local dbus_output, dbus_error = self:getMTKManagedObjects()
+        if not dbus_output then
+            return {}, dbus_error
+        end
         local mtk_devices = self:parseMTKDevices(dbus_output)
         -- Convert to our format
         local devices = {}
@@ -1053,7 +1181,10 @@ function Bluetooth:getPairedDevices()
     -- Get list of paired devices
     if self:isMTKDevice() then
         -- MTK: Get paired devices from D-Bus
-        local dbus_output = self:getMTKManagedObjects()
+        local dbus_output, dbus_error = self:getMTKManagedObjects()
+        if not dbus_output then
+            return {}, dbus_error
+        end
         local mtk_devices = self:parseMTKDevices(dbus_output)
         -- Filter to paired only
         local devices = {}
@@ -1275,8 +1406,12 @@ function Bluetooth:onBTRefreshScreen()
 end
 
 function Bluetooth:onBTBluetoothOffAndSleep()
-    -- Turn off Bluetooth first (without popup)
-    self:turnOffBluetooth()
+    -- Turn off Bluetooth first (without popup on success)
+    local success, detail = self:turnOffBluetooth()
+    if not success then
+        self:popup(_("Turning Bluetooth off before sleep failed:\n\n") .. (detail or "Unknown error"), 10)
+        return
+    end
     
     -- Wait 1 second, then put device to sleep
     UIManager:scheduleIn(1, function()
@@ -1686,8 +1821,12 @@ function Bluetooth:getDeviceManagementMenu()
         text = _("Start scanning (30s)"),
         enabled_func = function() return self.is_bluetooth_on end,
         callback = function()
-            self:startScan(30)
-            self:popup(_("Bluetooth scanning started.\n\nScan will automatically stop after 30 seconds.\n\nDevices will appear in 'Select from scanned devices'."), 4)
+            local success, detail = self:startScan(30)
+            if success then
+                self:popup(_("Bluetooth scanning started.\n\nScan will automatically stop after 30 seconds.\n\nDevices will appear in 'Select from scanned devices'."), 4)
+            else
+                self:popup(_("Bluetooth scanning failed:\n\n") .. (detail or "Unknown D-Bus error"), 10)
+            end
         end,
     })
     
@@ -1696,8 +1835,12 @@ function Bluetooth:getDeviceManagementMenu()
         text = _("Stop scanning"),
         enabled_func = function() return self.is_bluetooth_on end,
         callback = function()
-            self:stopScan()
-            self:popup(_("Bluetooth scanning stopped."), 2)
+            local success, detail = self:stopScan()
+            if success then
+                self:popup(_("Bluetooth scanning stopped."), 2)
+            else
+                self:popup(_("Stopping Bluetooth scanning failed:\n\n") .. (detail or "Unknown D-Bus error"), 10)
+            end
         end,
     })
     
@@ -2529,26 +2672,37 @@ function Bluetooth:showEventSelector(code, mappings)
 end
 
 function Bluetooth:getScannedDevicesMenu()
-    local devices = self:getScannedDevices()
+    local devices, dbus_error = self:getScannedDevices()
     local menu = {}
     
     if #devices == 0 then
         table.insert(menu, {
-            text = _("No devices found. Start scanning first."),
+            text = dbus_error
+                and (_("Bluetooth device query failed:\n\n") .. dbus_error)
+                or _("No devices found. Start scanning first."),
             enabled = false,
         })
-        -- Debug option to see raw output
+        -- Debug option to see the raw backend output
         table.insert(menu, {
             text = _("(Debug: Show raw output)"),
             callback = function()
-                -- Try direct command without timeout wrapper
-                local handle = io.popen("bluetoothctl devices 2>&1")
-                local raw = ""
-                if handle then
-                    raw = handle:read("*a") or ""
-                    handle:close()
+                local raw, error_detail
+                if self:isMTKDevice() then
+                    raw, error_detail = self:getMTKManagedObjects()
+                    local raw_output = error_detail or raw
+                    if not raw_output or raw_output == "" then
+                        raw_output = "(empty)"
+                    end
+                    self:popup(_("Raw D-Bus output:\n\n") .. raw_output, 10)
+                else
+                    local handle = io.popen("bluetoothctl devices 2>&1")
+                    raw = ""
+                    if handle then
+                        raw = handle:read("*a") or ""
+                        handle:close()
+                    end
+                    self:popup(_("Raw bluetoothctl output:\n\n") .. (raw == "" and "(empty)" or raw), 10)
                 end
-                self:popup(_("Raw bluetoothctl output:\n\n") .. (raw == "" and "(empty)" or raw), 10)
             end,
         })
     else
@@ -2566,12 +2720,14 @@ function Bluetooth:getScannedDevicesMenu()
 end
 
 function Bluetooth:getPairedDevicesMenu()
-    local devices = self:getPairedDevices()
+    local devices, dbus_error = self:getPairedDevices()
     local menu = {}
     
     if #devices == 0 then
         table.insert(menu, {
-            text = _("No paired devices found."),
+            text = dbus_error
+                and (_("Bluetooth paired-device query failed:\n\n") .. dbus_error)
+                or _("No paired devices found."),
             enabled = false,
         })
     else
@@ -2885,16 +3041,32 @@ function Bluetooth:getDiagnosticsMenu()
         callback = function()
             -- Re-check when clicked
             local is_on = self:isBluetoothOn()
+            local power_state_error = self.mtk_dbus_last_error
             local status_info = ""
             
             if self:isMTKDevice() then
                 -- MTK: show D-Bus status
                 status_info = _("Device type: MTK (") .. self:getMTKDeviceName() .. ")\n"
                 status_info = status_info .. _("Control method: D-Bus (com.kobo.mtk.bluedroid)\n\n")
-                
-                -- Show D-Bus service status
-                local dbus_check = self:executeCommand("dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1 | grep -q 'com.kobo.mtk.bluedroid' && echo 'Service active' || echo 'Service not found'")
-                status_info = status_info .. _("D-Bus service: ") .. (dbus_check or "unknown") .. "\n"
+
+                if power_state_error then
+                    status_info = status_info .. _("Bluetooth power-state query failed:\n") .. power_state_error .. "\n\n"
+                end
+
+                -- Check whether the D-Bus service owns its well-known name.
+                local service_cmd = "dbus-send --system --print-reply --dest=org.freedesktop.DBus " ..
+                    "/org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner " ..
+                    "string:" .. self.mtk_dbus.dest
+                local service_ok, service_detail, service_output = self:executeDBusCommand(
+                    "Check ownership of D-Bus name " .. self.mtk_dbus.dest, service_cmd
+                )
+                if service_ok and service_output and service_output:match("boolean%s+true") then
+                    status_info = status_info .. _("D-Bus service: active\n")
+                elseif service_ok then
+                    status_info = status_info .. _("D-Bus service: not registered (NameHasOwner returned false)\n")
+                else
+                    status_info = status_info .. _("D-Bus service check failed:\n") .. service_detail .. "\n"
+                end
                 
                 -- Check mtkbtd/btservice processes
                 local processes = self:executeCommand("ps aux | grep -E '(mtkbtd|btservice)' | grep -v grep")
@@ -3975,8 +4147,14 @@ function Bluetooth:turnOnBluetoothCommands()
     -- Step 3: Attach HCI (device-specific command)
     table.insert(results, self:executeCommand(bt_config.hci_attach))
     
-    -- Step 4: Initialize D-Bus/BlueZ (silently - we don't need the verbose output)
-    os.execute("dbus-send --system --dest=org.bluez / org.freedesktop.DBus.ObjectManager.GetManagedObjects > /dev/null 2>&1")
+    -- Step 4: Initialize D-Bus/BlueZ and preserve any failure details
+    local dbus_ok, dbus_detail = self:executeDBusCommand(
+        "Call org.freedesktop.DBus.ObjectManager.GetManagedObjects on org.bluez",
+        "dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.ObjectManager.GetManagedObjects"
+    )
+    if not dbus_ok then
+        table.insert(results, dbus_detail)
+    end
     
     -- Step 5: Bring up HCI interface
     table.insert(results, self:executeCommand("hciconfig hci0 up"))
@@ -4017,17 +4195,20 @@ function Bluetooth:onBluetoothOn()
 end
 
 function Bluetooth:onBluetoothOff()
-    self:turnOffBluetooth()
-    self:popup(_("Bluetooth turned off."))
+    local success, detail = self:turnOffBluetooth()
+    if success then
+        self:popup(_("Bluetooth turned off."))
+    else
+        self:popup(_("Turning Bluetooth off failed:\n\n") .. (detail or "Unknown error"), 10)
+    end
 end
 
 function Bluetooth:turnOffBluetooth()
     -- Check if we're on an MTK device - use D-Bus instead
     if self:isMTKDevice() then
-        self:turnOffMTKBluetooth()
         -- Note: MTK devices may need a reboot before returning to Nickel
         -- due to non-idempotent kernel driver initialization
-        return
+        return self:turnOffMTKBluetooth()
     end
     
     -- i.MX6 devices: use traditional method
@@ -4055,6 +4236,7 @@ function Bluetooth:turnOffBluetooth()
     -- Step 5: Unload UHID module
     self:executeCommand("rmmod uhid")
     -- Note: is_bluetooth_on cache will be updated on next isBluetoothOn() call
+    return true, "Bluetooth turned off"
 end
 
 function Bluetooth:onRefreshPairing()

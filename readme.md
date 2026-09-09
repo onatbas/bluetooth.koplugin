@@ -200,6 +200,8 @@ Bank system is intended for controllers with fewer buttons than intended number 
 2. Put controller in pairing mode
 3. Wait for scan to complete (30 seconds)
 
+On MTK devices, D-Bus failures include the operation, object or interface involved, exit status, and the raw D-Bus response so the actual cause is visible in the error message.
+
 ---
 
 ## Available BT Events
