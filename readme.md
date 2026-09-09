@@ -122,6 +122,7 @@ Everything is automatic:
 - ✅ Installation path detection
 - ✅ Device-specific Bluetooth commands (Clara 2E vs Libra 2)
 - ✅ Input device path (event3/event4)
+- ✅ Automatic input refresh after connecting Bluetooth devices
 - ✅ Button mappings
 - ✅ hasKeys override
 

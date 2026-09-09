@@ -30,6 +30,8 @@ local Bluetooth = InputContainer:extend{
     _watching = false,
     _watch_path = nil,
     _watch_inode = nil,
+    _input_refresh_poll = nil,
+    _input_opened_path = nil,
 }
 
 -- Input device paths per device model
@@ -1231,6 +1233,7 @@ function Bluetooth:connectToDevice(mac, device_path)
         end
         local success, result = self:connectMTKDevice(device_path)
         if success then
+            self:refreshInputDeviceWhenAvailable()
             return true, result or "Connected via D-Bus"
         else
             return false, result or "D-Bus connection failed"
@@ -1240,6 +1243,9 @@ function Bluetooth:connectToDevice(mac, device_path)
     -- i.MX6: use bluetoothctl
     local result = self:executeCommand("timeout 5s bluetoothctl connect " .. mac)
     local success = result:match("Connection successful") ~= nil
+    if success then
+        self:refreshInputDeviceWhenAvailable()
+    end
     return success, result
 end
 
@@ -2937,6 +2943,121 @@ function Bluetooth:updateInputDevicePath()
     return path, is_known, method, extra
 end
 
+function Bluetooth:refreshInputDevice(require_bluetooth_hid)
+    -- Re-detect and register the input device after Bluetooth creates its HID node.
+    local path, is_known, method, extra = self:getInputDevicePath()
+    if not path or path == "" then
+        return false, "No input device path was detected."
+    end
+
+    -- On MTK devices, do not accept the startup fallback while waiting for the
+    -- kernel to create the newly connected Bluetooth HID device.
+    if require_bluetooth_hid and self:isMTKDevice()
+            and (not method or not method:match("^mtk_uhid_")) then
+        return false, "Bluetooth HID input device is not available yet."
+    end
+
+    local lfs = require("libs/libkoreader-lfs")
+    if not lfs.attributes(path) then
+        return false, "Input device path does not exist yet: " .. path
+    end
+
+    local status, err = pcall(function()
+        -- Only close a device previously opened by this plugin. The path from
+        -- startup may belong to KOReader's core input setup.
+        if self._input_opened_path and self._input_opened_path ~= path then
+            Device.input:close(self._input_opened_path)
+        end
+        Device.input:close(path)
+        Device.input:open(path)
+    end)
+    if not status then
+        return false, "Could not open input device " .. path .. ": " .. tostring(err)
+    end
+
+    self.input_device_path = path
+    self.input_path_is_known = is_known
+    self.input_path_method = method
+    self.input_path_extra = extra
+    self._input_opened_path = path
+
+    local msg = "Input device opened: " .. path
+    if method == "mtk_uhid_auto" then
+        msg = msg .. "\n(Detected Bluetooth HID device: " .. (extra or "unnamed") .. ")"
+    elseif method == "mtk_uhid_name_match" then
+        msg = msg .. "\n(Matched Bluetooth HID device: " .. (extra or "unnamed") .. ")"
+    elseif method == "mtk_uhid_highest" then
+        msg = msg .. "\n(Selected highest-numbered Bluetooth HID device)"
+    elseif method == "bt_name_match" then
+        msg = msg .. "\n(Matched by Bluetooth device name: " .. (extra or "?") .. ")"
+    elseif method == "device_model" then
+        msg = msg .. "\n(Known path for " .. (extra or Device.model) .. ")"
+    elseif method == "highest_event" then
+        msg = msg .. "\n(Best guess: highest event number)"
+    else
+        msg = msg .. "\n(Default fallback)"
+    end
+    return true, msg
+end
+
+function Bluetooth:refreshInputDeviceWhenAvailable(on_complete)
+    -- HID event nodes appear asynchronously after a successful Bluetooth
+    -- connection, so poll for the actual uhid device instead of guessing a
+    -- fixed delay.
+    if self._input_refresh_poll then
+        UIManager:unschedule(self._input_refresh_poll)
+        self._input_refresh_poll = nil
+    end
+
+    local attempts = 0
+    local max_attempts = 10
+    local function try_refresh()
+        local ok, success, detail = pcall(self.refreshInputDevice, self, true)
+        if not ok then
+            return false, "Input refresh failed: " .. tostring(success)
+        end
+        return success, detail
+    end
+    local function finish(success, detail)
+        self._input_refresh_poll = nil
+        if on_complete then
+            on_complete(success, detail)
+        elseif not success then
+            self:popup(_("Bluetooth connected, but its input device was not detected automatically.") ..
+                "\n\n" .. (detail or "Unknown error") .. "\n\n" ..
+                _("Use 'Refresh Device Input' to try again."), 10)
+        end
+    end
+
+    -- Try immediately in case the HID node already exists (for example after
+    -- connecting to a device that was connected before KOReader started).
+    attempts = attempts + 1
+    local success, detail = try_refresh()
+    if success then
+        finish(true, detail)
+        return
+    end
+
+    local poll
+    poll = function()
+        if self._input_refresh_poll ~= poll then
+            return
+        end
+
+        attempts = attempts + 1
+        local success, detail = try_refresh()
+        if success or attempts >= max_attempts then
+            finish(success, detail)
+            return
+        end
+
+        UIManager:scheduleIn(0.5, poll)
+    end
+
+    self._input_refresh_poll = poll
+    UIManager:scheduleIn(0.5, poll)
+end
+
 function Bluetooth:detectBluetoothBinaries()
     -- Check which Bluetooth binaries exist in /sbin
     local lfs = require("libs/libkoreader-lfs")
@@ -4174,6 +4295,12 @@ function Bluetooth:onBluetoothOn()
         elseif detection_type == "default" then
             config_note = _("\n(Using default config)")
         end
+
+        -- A saved MTK remote may reconnect through Kobo's Bluetooth stack
+        -- without going through this plugin's connect action.
+        if self:isMTKDevice() and self:getSavedDeviceMAC() then
+            self:refreshInputDeviceWhenAvailable(function() end)
+        end
         self:popup(_("Bluetooth turned on.") .. config_note)
     else
         -- Truncate long results to avoid huge popups
@@ -4245,35 +4372,11 @@ function Bluetooth:onRefreshPairing()
         return
     end
 
-    -- Dynamically update input device path (try to match by BT device name first)
-    local path, is_known, method, extra = self:updateInputDevicePath()
-
-    local status, err = pcall(function()
-        -- Ensure the device path is valid
-        if not path or path == "" then
-            error("Invalid device path")
-        end
-
-        Device.input:close(path) -- Close the input using the high-level parameter
-        Device.input:open(path)  -- Reopen the input using the high-level parameter
-        
-        -- Build informative message
-        local msg = _("Input device opened: ") .. path
-        if method == "bt_name_match" then
-            msg = msg .. "\n" .. _("(Matched by Bluetooth device name: ") .. (extra or "?") .. ")"
-        elseif method == "device_model" then
-            msg = msg .. "\n" .. _("(Known path for ") .. (extra or Device.model) .. ")"
-        elseif method == "highest_event" then
-            msg = msg .. "\n" .. _("(Best guess: highest event number)")
-        else
-            msg = msg .. "\n" .. _("(Default fallback)")
-        end
-        
-        self:popup(msg, 4)
-    end)
-
-    if not status then
-        self:popup(_("Error: ") .. err)
+    local success, detail = self:refreshInputDevice(false)
+    if success then
+        self:popup(detail, 4)
+    else
+        self:popup(_("Error refreshing input: ") .. detail, 5)
     end
 end
 
@@ -4480,18 +4583,15 @@ function Bluetooth:onFullBluetoothSetup()
                     UIManager:scheduleIn(1, function()
                         self:popup(connect_success and _("✓ Device connected") or _("⚠ Connection may have failed"), 2)
                         
-                        -- Step 4: Refresh device input
+                        -- Step 4: Wait for the kernel HID device and refresh input
                         UIManager:scheduleIn(1, function()
                             self:popup(_("Step 4: Refreshing device input..."), 4)
-                            local status, err = pcall(function()
-                                if not self.input_device_path or self.input_device_path == "" then
-                                    error("Invalid device path")
+                            self:refreshInputDeviceWhenAvailable(function(input_success, input_detail)
+                                if not input_success then
+                                    self:popup(_("Error refreshing input: ") .. (input_detail or "Unknown error"), 8)
+                                    return
                                 end
-                                Device.input:close(self.input_device_path)
-                                Device.input:open(self.input_device_path)
-                            end)
-                            
-                            if status then
+
                                 UIManager:scheduleIn(1, function()
                                     self:popup(_("✓ Device input refreshed"), 2)
                                     
@@ -4513,9 +4613,7 @@ function Bluetooth:onFullBluetoothSetup()
                                         end
                                     end)
                                 end)
-                            else
-                                self:popup(_("Error refreshing input: ") .. err, 4)
-                            end
+                            end)
                         end)
                     end)
                 end)
