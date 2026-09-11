@@ -30,6 +30,8 @@ local Bluetooth = InputContainer:extend{
     _watching = false,
     _watch_path = nil,
     _watch_inode = nil,
+    _input_refresh_poll = nil,
+    _input_opened_path = nil,
 }
 
 -- Input device paths per device model
@@ -116,7 +118,7 @@ Bluetooth.mtk_dbus = {
     -- Check if Bluetooth is powered
     cmd_check_powered = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
         .. 'org.freedesktop.DBus.Properties.Get '
-        .. 'string:org.bluez.Adapter1 string:Powered 2>/dev/null',
+        .. 'string:org.bluez.Adapter1 string:Powered',
     
     -- Start/stop discovery
     cmd_start_discovery = 'dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 '
@@ -129,27 +131,49 @@ Bluetooth.mtk_dbus = {
         .. 'org.freedesktop.DBus.ObjectManager.GetManagedObjects',
 }
 
--- Default BTAction key mappings for 8BitDo controller
--- These will be written to settings/event_map.lua if auto-correction is used
-Bluetooth.default_event_mappings = {
-    [19]  = "BTAction1",   -- R
-    [23]  = "BTAction2",   -- I
-    [25]  = "BTAction3",   -- P/Y
-    [32]  = "BTAction4",   -- D/R2
-    [38]  = "BTAction5",   -- L/L2
-    [45]  = "BTAction6",   -- X
-    [46]  = "BTAction7",   -- C/B
-    [48]  = "BTAction8",   -- B/UP
-    [49]  = "BTAction9",   -- N/A
-    [60]  = "BTAction15",  -- F2 (bank switch)
-    [61]  = "BTAction16",  -- F3 (bank switch)
-    [103] = "BTAction10",  -- Up arrow
-    [105] = "BTAction11",  -- Left arrow
-    [106] = "BTAction12",  -- Right arrow
-    [108] = "BTAction13",  -- Down arrow
-    [109] = "BTAction14",  -- Page Down
-    [115] = "BTLeft",      -- Additional button
+-- Default event mapping profiles
+-- These mappings can be applied from the Event Map Editor and are written to
+-- settings/event_map.lua so the selected profile persists across restarts.
+Bluetooth.default_event_mapping_profiles = {
+    ["8bitdo_micro"] = {
+        name = "8BitDo Micro",
+        mappings = {
+            [19]  = "BTAction1",   -- R
+            [23]  = "BTAction2",   -- I
+            [25]  = "BTAction3",   -- P/Y
+            [32]  = "BTAction4",   -- D/R2
+            [38]  = "BTAction5",   -- L/L2
+            [45]  = "BTAction6",   -- X
+            [46]  = "BTAction7",   -- C/B
+            [48]  = "BTAction8",   -- B/UP
+            [49]  = "BTAction9",   -- N/A
+            [60]  = "BTAction15",  -- F2 (bank switch)
+            [61]  = "BTAction16",  -- F3 (bank switch)
+            [103] = "BTAction10",  -- Up arrow
+            [105] = "BTAction11",  -- Left arrow
+            [106] = "BTAction12",  -- Right arrow
+            [108] = "BTAction13",  -- Down arrow
+            [109] = "BTAction14",  -- Page Down
+            [115] = "BTLeft",      -- Additional button
+        },
+    },
+    ["tolino_flip"] = {
+        name = "tolino flip remote",
+        mappings = {
+            [103] = "BTLeft",  -- KEY_UP: previous page
+            [108] = "BTRight", -- KEY_DOWN: next page
+        },
+    },
 }
+
+Bluetooth.default_event_mapping_profile_order = {
+    "8bitdo_micro",
+    "tolino_flip",
+}
+
+-- Keep the 8BitDo profile as the fallback for code paths that need a default
+-- mapping without an explicitly selected profile.
+Bluetooth.default_event_mappings = Bluetooth.default_event_mapping_profiles["8bitdo_micro"].mappings
 
 -- Config file for storing Bluetooth device settings
 Bluetooth.config_file = "bt_config.lua"
@@ -367,67 +391,160 @@ function Bluetooth:getMTKDeviceName()
     return "MTK Device"
 end
 
+function Bluetooth:executeDBusCommand(operation, command)
+    -- LuaJIT's io.popen():close() does not expose the child exit status on Kobo.
+    -- Append a shell marker so errors and their exit status can be reported together.
+    local status_marker = "__BLUETOOTH_DBUS_EXIT_STATUS__="
+    local handle = io.popen(
+        command .. " 2>&1; printf '\\n" .. status_marker .. "%s\\n' \"$?\""
+    )
+    if not handle then
+        return false, operation .. " failed: could not start D-Bus command"
+    end
+
+    local raw_output = handle:read("*a") or ""
+    handle:close()
+
+    local marker_start = raw_output:find("\n" .. status_marker, 1, true)
+    if not marker_start then
+        local output = raw_output:gsub("^%s+", ""):gsub("%s+$", "")
+        if output == "" then
+            output = "(no output)"
+        end
+        return false, operation .. " failed: could not determine exit status.\nOutput: " .. output, raw_output
+    end
+
+    local output = raw_output:sub(1, marker_start - 1)
+    output = output:gsub("^%s+", ""):gsub("%s+$", "")
+    local status = tonumber(raw_output:match(status_marker .. "(%d+)", marker_start + 1))
+    if not status then
+        if output == "" then
+            output = "(no output)"
+        end
+        return false, operation .. " failed: could not parse exit status.\nOutput: " .. output, output
+    end
+
+    local has_dbus_error = output:match("^Error [%w%._]+:") or output:match("\nError [%w%._]+:")
+    if status ~= 0 or has_dbus_error then
+        local error_output = output ~= "" and output or "(no D-Bus error output)"
+        local status_detail = status ~= 0
+            and string.format("exit status %d", status)
+            or "D-Bus returned an error reply"
+        return false, string.format(
+            "%s failed (%s):\n%s", operation, status_detail, error_output
+        ), output, status
+    end
+
+    if output == "" then
+        return true, operation .. " completed without reply output.", output, status
+    end
+    return true, output, output, status
+end
+
 function Bluetooth:isMTKBluetoothOn()
     -- Check if Bluetooth is powered on via D-Bus on MTK devices
-    local result = self:executeCommand(self.mtk_dbus.cmd_check_powered)
-    if result and result:match("boolean%s+true") then
+    local success, detail, output = self:executeDBusCommand(
+        "Read org.bluez.Adapter1.Powered from /org/bluez/hci0", self.mtk_dbus.cmd_check_powered
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+
+    if success and output and output:match("boolean%s+true") then
         self.is_bluetooth_on = true
-        return true
-    else
-        self.is_bluetooth_on = false
-        return false
+        return true, detail
     end
+
+    self.is_bluetooth_on = false
+    return false, detail
 end
 
 function Bluetooth:turnOnMTKBluetooth()
     -- Turn on Bluetooth on MTK devices using D-Bus
+    local details = {}
+
     -- Step 1: Call BluedroidManager1.On() - this auto-starts the service
-    local result1 = self:executeCommand(self.mtk_dbus.cmd_on)
-    
+    local on_ok, on_detail = self:executeDBusCommand(
+        "Call " .. self.mtk_dbus.dest .. ".com.kobo.bluetooth.BluedroidManager1.On()",
+        self.mtk_dbus.cmd_on
+    )
+    table.insert(details, on_detail)
+
     -- Step 2: Power on the adapter
-    local result2 = self:executeCommand(self.mtk_dbus.cmd_power_on)
-    
-    -- Check if successful
-    if self:isMTKBluetoothOn() then
+    local power_ok, power_detail = self:executeDBusCommand(
+        "Set org.bluez.Adapter1.Powered=true on /org/bluez/hci0",
+        self.mtk_dbus.cmd_power_on
+    )
+    table.insert(details, power_detail)
+
+    -- Verify the final state, even if one of the setup calls reported an error.
+    local powered, state_detail = self:isMTKBluetoothOn()
+    if powered then
         return true, "Bluetooth enabled via D-Bus"
-    else
-        return false, "Failed to enable Bluetooth via D-Bus"
     end
+
+    if self.mtk_dbus_last_error then
+        table.insert(details, self.mtk_dbus_last_error)
+    else
+        table.insert(details, "Read org.bluez.Adapter1.Powered returned false:\n" .. (state_detail or "(no reply output)"))
+    end
+    return false, table.concat(details, "\n\n")
 end
 
 function Bluetooth:turnOffMTKBluetooth()
     -- Turn off Bluetooth on MTK devices using D-Bus
+    local details = {}
+
     -- Step 1: Power off the adapter
-    self:executeCommand(self.mtk_dbus.cmd_power_off)
-    
+    local power_ok, power_detail = self:executeDBusCommand(
+        "Set org.bluez.Adapter1.Powered=false on /org/bluez/hci0",
+        self.mtk_dbus.cmd_power_off
+    )
+    table.insert(details, power_detail)
+
     -- Step 2: Call BluedroidManager1.Off()
-    self:executeCommand(self.mtk_dbus.cmd_off)
-    
+    local off_ok, off_detail = self:executeDBusCommand(
+        "Call " .. self.mtk_dbus.dest .. ".com.kobo.bluetooth.BluedroidManager1.Off()",
+        self.mtk_dbus.cmd_off
+    )
+    table.insert(details, off_detail)
+
     -- Note: MTK devices may need a reboot before returning to Nickel
     -- due to non-idempotent kernel driver initialization
-    return true
+    if power_ok and off_ok then
+        return true, "Bluetooth disabled via D-Bus"
+    end
+    return false, table.concat(details, "\n\n")
 end
 
 function Bluetooth:startMTKDiscovery()
     -- Start Bluetooth discovery on MTK devices
-    local result = os.execute(self.mtk_dbus.cmd_start_discovery)
-    return result == 0
+    local success, detail = self:executeDBusCommand(
+        "Call org.bluez.Adapter1.StartDiscovery on /org/bluez/hci0",
+        self.mtk_dbus.cmd_start_discovery
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    return success, detail
 end
 
 function Bluetooth:stopMTKDiscovery()
     -- Stop Bluetooth discovery on MTK devices
-    local result = os.execute(self.mtk_dbus.cmd_stop_discovery)
-    return result == 0
+    local success, detail = self:executeDBusCommand(
+        "Call org.bluez.Adapter1.StopDiscovery on /org/bluez/hci0",
+        self.mtk_dbus.cmd_stop_discovery
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    return success, detail
 end
 
 function Bluetooth:getMTKManagedObjects()
     -- Get all Bluetooth devices via D-Bus GetManagedObjects
-    local handle = io.popen(self.mtk_dbus.cmd_get_devices)
-    if not handle then
-        return nil
+    local success, detail, output = self:executeDBusCommand(
+        "Call org.freedesktop.DBus.ObjectManager.GetManagedObjects on " .. self.mtk_dbus.dest,
+        self.mtk_dbus.cmd_get_devices
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    if not success then
+        return nil, detail
     end
-    local output = handle:read("*a")
-    handle:close()
     return output
 end
 
@@ -538,52 +655,110 @@ function Bluetooth:parseMTKDevices(dbus_output)
     return devices
 end
 
+function Bluetooth:isMTKDeviceConnected(device_path)
+    -- Treat an already connected device as a successful connection request.
+    local cmd = string.format(
+        "dbus-send --system --print-reply --dest=%s %s "
+        .. "org.freedesktop.DBus.Properties.Get "
+        .. "string:org.bluez.Device1 string:Connected",
+        self.mtk_dbus.dest, device_path
+    )
+    local success, detail, output = self:executeDBusCommand(
+        "Read org.bluez.Device1.Connected from " .. device_path, cmd
+    )
+    self.mtk_dbus_last_error = success and nil or detail
+    if not success then
+        return false, detail
+    end
+    return output and output:match("boolean%s+true") ~= nil
+end
+
 function Bluetooth:connectMTKDevice(device_path)
     -- Connect to a Bluetooth device on MTK via D-Bus
+    -- Device1.Connect returns AlreadyConnected when the desired state is already true.
+    local connected, state_error = self:isMTKDeviceConnected(device_path)
+    if connected then
+        return true, "Already connected via D-Bus"
+    end
+
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s org.bluez.Device1.Connect",
-        device_path
+        "dbus-send --system --print-reply --dest=%s %s org.bluez.Device1.Connect",
+        self.mtk_dbus.dest, device_path
     )
-    local result = os.execute(cmd)
-    return result == 0
+    local success, detail, output = self:executeDBusCommand(
+        "Call org.bluez.Device1.Connect on " .. device_path, cmd
+    )
+
+    if success then
+        self.mtk_dbus_last_error = nil
+        return true, "Connected via D-Bus"
+    end
+
+    -- A concurrent connection can make the state change after the check above.
+    if output and output:match("org%.bluez%.Error%.AlreadyConnected") then
+        self.mtk_dbus_last_error = nil
+        return true, "Already connected via D-Bus"
+    end
+
+    if state_error then
+        detail = state_error .. "\n\n" .. (detail or "D-Bus connection failed")
+    end
+    return false, detail or "D-Bus connection failed"
 end
 
 function Bluetooth:disconnectMTKDevice(device_path)
     -- Disconnect from a Bluetooth device on MTK via D-Bus
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s org.bluez.Device1.Disconnect",
-        device_path
+        "dbus-send --system --print-reply --dest=%s %s org.bluez.Device1.Disconnect",
+        self.mtk_dbus.dest, device_path
     )
-    local result = os.execute(cmd)
-    return result == 0
+    return self:executeDBusCommand(
+        "Call org.bluez.Device1.Disconnect on " .. device_path, cmd
+    )
 end
 
 function Bluetooth:trustMTKDevice(device_path, trusted)
     -- Set/unset Trusted property on a device
     local trust_str = trusted and "true" or "false"
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid %s "
+        "dbus-send --system --print-reply --dest=%s %s "
         .. "org.freedesktop.DBus.Properties.Set "
         .. "string:org.bluez.Device1 string:Trusted variant:boolean:%s",
-        device_path, trust_str
+        self.mtk_dbus.dest, device_path, trust_str
     )
-    local result = os.execute(cmd)
-    return result == 0
+    return self:executeDBusCommand(
+        "Set org.bluez.Device1.Trusted=" .. trust_str .. " on " .. device_path,
+        cmd
+    )
 end
 
 function Bluetooth:removeMTKDevice(device_path)
     -- Remove (unpair) a Bluetooth device on MTK
-    -- First disconnect
-    self:disconnectMTKDevice(device_path)
-    
+    -- First disconnect, but continue if that operation fails (for example when
+    -- the device is already disconnected).
+    local disconnect_ok, disconnect_detail = self:disconnectMTKDevice(device_path)
+
     -- Then remove from adapter
     local cmd = string.format(
-        "dbus-send --system --print-reply --dest=com.kobo.mtk.bluedroid /org/bluez/hci0 "
+        "dbus-send --system --print-reply --dest=%s /org/bluez/hci0 "
         .. "org.bluez.Adapter1.RemoveDevice objpath:%s",
-        device_path
+        self.mtk_dbus.dest, device_path
     )
-    local result = os.execute(cmd)
-    return result == 0
+    local remove_ok, remove_detail = self:executeDBusCommand(
+        "Call org.bluez.Adapter1.RemoveDevice for " .. device_path, cmd
+    )
+
+    if remove_ok then
+        if disconnect_ok then
+            return true, remove_detail
+        end
+        return true, "Device removed, but disconnect failed:\n\n" .. disconnect_detail
+    end
+
+    if not disconnect_ok then
+        return false, disconnect_detail .. "\n\n" .. remove_detail
+    end
+    return false, remove_detail
 end
 
 function Bluetooth:detectMTKBluetoothInputDevices()
@@ -965,7 +1140,10 @@ function Bluetooth:getScannedDevices()
     -- Get list of discovered devices
     if self:isMTKDevice() then
         -- MTK: Get all devices from D-Bus
-        local dbus_output = self:getMTKManagedObjects()
+        local dbus_output, dbus_error = self:getMTKManagedObjects()
+        if not dbus_output then
+            return {}, dbus_error
+        end
         local mtk_devices = self:parseMTKDevices(dbus_output)
         -- Convert to our format
         local devices = {}
@@ -1005,7 +1183,10 @@ function Bluetooth:getPairedDevices()
     -- Get list of paired devices
     if self:isMTKDevice() then
         -- MTK: Get paired devices from D-Bus
-        local dbus_output = self:getMTKManagedObjects()
+        local dbus_output, dbus_error = self:getMTKManagedObjects()
+        if not dbus_output then
+            return {}, dbus_error
+        end
         local mtk_devices = self:parseMTKDevices(dbus_output)
         -- Filter to paired only
         local devices = {}
@@ -1050,17 +1231,21 @@ function Bluetooth:connectToDevice(mac, device_path)
             local mac_underscore = mac:gsub(":", "_")
             device_path = "/org/bluez/hci0/dev_" .. mac_underscore
         end
-        local success = self:connectMTKDevice(device_path)
+        local success, result = self:connectMTKDevice(device_path)
         if success then
-            return true, "Connected via D-Bus"
+            self:refreshInputDeviceWhenAvailable()
+            return true, result or "Connected via D-Bus"
         else
-            return false, "D-Bus connection failed"
+            return false, result or "D-Bus connection failed"
         end
     end
     
     -- i.MX6: use bluetoothctl
     local result = self:executeCommand("timeout 5s bluetoothctl connect " .. mac)
     local success = result:match("Connection successful") ~= nil
+    if success then
+        self:refreshInputDeviceWhenAvailable()
+    end
     return success, result
 end
 
@@ -1227,8 +1412,12 @@ function Bluetooth:onBTRefreshScreen()
 end
 
 function Bluetooth:onBTBluetoothOffAndSleep()
-    -- Turn off Bluetooth first (without popup)
-    self:turnOffBluetooth()
+    -- Turn off Bluetooth first (without popup on success)
+    local success, detail = self:turnOffBluetooth()
+    if not success then
+        self:popup(_("Turning Bluetooth off before sleep failed:\n\n") .. (detail or "Unknown error"), 10)
+        return
+    end
     
     -- Wait 1 second, then put device to sleep
     UIManager:scheduleIn(1, function()
@@ -1638,8 +1827,12 @@ function Bluetooth:getDeviceManagementMenu()
         text = _("Start scanning (30s)"),
         enabled_func = function() return self.is_bluetooth_on end,
         callback = function()
-            self:startScan(30)
-            self:popup(_("Bluetooth scanning started.\n\nScan will automatically stop after 30 seconds.\n\nDevices will appear in 'Select from scanned devices'."), 4)
+            local success, detail = self:startScan(30)
+            if success then
+                self:popup(_("Bluetooth scanning started.\n\nScan will automatically stop after 30 seconds.\n\nDevices will appear in 'Select from scanned devices'."), 4)
+            else
+                self:popup(_("Bluetooth scanning failed:\n\n") .. (detail or "Unknown D-Bus error"), 10)
+            end
         end,
     })
     
@@ -1648,8 +1841,12 @@ function Bluetooth:getDeviceManagementMenu()
         text = _("Stop scanning"),
         enabled_func = function() return self.is_bluetooth_on end,
         callback = function()
-            self:stopScan()
-            self:popup(_("Bluetooth scanning stopped."), 2)
+            local success, detail = self:stopScan()
+            if success then
+                self:popup(_("Bluetooth scanning stopped."), 2)
+            else
+                self:popup(_("Stopping Bluetooth scanning failed:\n\n") .. (detail or "Unknown D-Bus error"), 10)
+            end
         end,
     })
     
@@ -1803,6 +2000,99 @@ function Bluetooth:saveEventMap(mappings)
     return true, path
 end
 
+function Bluetooth:applyDefaultEventMappingProfile(profile_id)
+    local profile = self.default_event_mapping_profiles[profile_id]
+    if not profile then
+        return false, "Unknown default mapping profile: " .. tostring(profile_id)
+    end
+
+    local success, result = self:autoCorrectEventMap(profile.mappings)
+    if not success then
+        return false, result
+    end
+
+    return true, string.format(
+        _("Applied default mapping profile: %s"), profile.name
+    ) .. "\n\n" .. result
+end
+
+function Bluetooth:confirmDefaultEventMappingProfile(profile_id)
+    local profile = self.default_event_mapping_profiles[profile_id]
+    if not profile then
+        self:popup("Unknown default mapping profile: " .. tostring(profile_id), 5)
+        return
+    end
+
+    local lines = {
+        string.format(_("Apply the default mappings for %s?"), profile.name),
+        "",
+        _("This replaces all current Bluetooth event mappings."),
+        "",
+        _("Mappings:"),
+    }
+    local codes = {}
+    for code, _ in pairs(profile.mappings) do
+        table.insert(codes, code)
+    end
+    table.sort(codes)
+    for _, code in ipairs(codes) do
+        table.insert(lines, string.format("  [%d] → %s", code, profile.mappings[code]))
+    end
+
+    UIManager:show(ConfirmBox:new{
+        text = table.concat(lines, "\n"),
+        ok_text = _("Apply"),
+        ok_callback = function()
+            local success, result = self:applyDefaultEventMappingProfile(profile_id)
+            if success then
+                self:popup(_("✓ ") .. result, 8)
+            else
+                self:popup(_("✗ Failed to apply default mappings:\n") .. result, 8)
+            end
+        end,
+        cancel_text = _("Cancel"),
+    })
+end
+
+function Bluetooth:showDefaultMappingProfiles()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local buttons = {}
+
+    local function addProfileButton(profile_id, profile)
+        table.insert(buttons, {
+            {
+                text = profile.name,
+                callback = function()
+                    UIManager:close(self._default_mapping_profiles_dialog)
+                    self:confirmDefaultEventMappingProfile(profile_id)
+                end,
+            },
+        })
+    end
+
+    for _, profile_id in ipairs(self.default_event_mapping_profile_order) do
+        local profile = self.default_event_mapping_profiles[profile_id]
+        if profile then
+            addProfileButton(profile_id, profile)
+        end
+    end
+
+    table.insert(buttons, {
+        {
+            text = _("Cancel"),
+            callback = function()
+                UIManager:close(self._default_mapping_profiles_dialog)
+            end,
+        },
+    })
+
+    self._default_mapping_profiles_dialog = ButtonDialog:new{
+        title = _("Choose a default mapping profile"),
+        buttons = buttons,
+    }
+    UIManager:show(self._default_mapping_profiles_dialog)
+end
+
 function Bluetooth:getEventMapEditorMenu()
     local menu = {}
     local mappings = self:getCurrentEventMap()
@@ -1859,6 +2149,14 @@ function Bluetooth:getEventMapEditorMenu()
         end,
     })
     
+    -- Choose a default mapping profile
+    table.insert(menu, {
+        text = _("📋 Choose default mapping profile"),
+        callback = function()
+            self:showDefaultMappingProfiles()
+        end,
+    })
+
     -- Reload from file
     table.insert(menu, {
         text = _("🔄 Reload from file"),
@@ -2380,26 +2678,37 @@ function Bluetooth:showEventSelector(code, mappings)
 end
 
 function Bluetooth:getScannedDevicesMenu()
-    local devices = self:getScannedDevices()
+    local devices, dbus_error = self:getScannedDevices()
     local menu = {}
     
     if #devices == 0 then
         table.insert(menu, {
-            text = _("No devices found. Start scanning first."),
+            text = dbus_error
+                and (_("Bluetooth device query failed:\n\n") .. dbus_error)
+                or _("No devices found. Start scanning first."),
             enabled = false,
         })
-        -- Debug option to see raw output
+        -- Debug option to see the raw backend output
         table.insert(menu, {
             text = _("(Debug: Show raw output)"),
             callback = function()
-                -- Try direct command without timeout wrapper
-                local handle = io.popen("bluetoothctl devices 2>&1")
-                local raw = ""
-                if handle then
-                    raw = handle:read("*a") or ""
-                    handle:close()
+                local raw, error_detail
+                if self:isMTKDevice() then
+                    raw, error_detail = self:getMTKManagedObjects()
+                    local raw_output = error_detail or raw
+                    if not raw_output or raw_output == "" then
+                        raw_output = "(empty)"
+                    end
+                    self:popup(_("Raw D-Bus output:\n\n") .. raw_output, 10)
+                else
+                    local handle = io.popen("bluetoothctl devices 2>&1")
+                    raw = ""
+                    if handle then
+                        raw = handle:read("*a") or ""
+                        handle:close()
+                    end
+                    self:popup(_("Raw bluetoothctl output:\n\n") .. (raw == "" and "(empty)" or raw), 10)
                 end
-                self:popup(_("Raw bluetoothctl output:\n\n") .. (raw == "" and "(empty)" or raw), 10)
             end,
         })
     else
@@ -2417,12 +2726,14 @@ function Bluetooth:getScannedDevicesMenu()
 end
 
 function Bluetooth:getPairedDevicesMenu()
-    local devices = self:getPairedDevices()
+    local devices, dbus_error = self:getPairedDevices()
     local menu = {}
     
     if #devices == 0 then
         table.insert(menu, {
-            text = _("No paired devices found."),
+            text = dbus_error
+                and (_("Bluetooth paired-device query failed:\n\n") .. dbus_error)
+                or _("No paired devices found."),
             enabled = false,
         })
     else
@@ -2632,6 +2943,121 @@ function Bluetooth:updateInputDevicePath()
     return path, is_known, method, extra
 end
 
+function Bluetooth:refreshInputDevice(require_bluetooth_hid)
+    -- Re-detect and register the input device after Bluetooth creates its HID node.
+    local path, is_known, method, extra = self:getInputDevicePath()
+    if not path or path == "" then
+        return false, "No input device path was detected."
+    end
+
+    -- On MTK devices, do not accept the startup fallback while waiting for the
+    -- kernel to create the newly connected Bluetooth HID device.
+    if require_bluetooth_hid and self:isMTKDevice()
+            and (not method or not method:match("^mtk_uhid_")) then
+        return false, "Bluetooth HID input device is not available yet."
+    end
+
+    local lfs = require("libs/libkoreader-lfs")
+    if not lfs.attributes(path) then
+        return false, "Input device path does not exist yet: " .. path
+    end
+
+    local status, err = pcall(function()
+        -- Only close a device previously opened by this plugin. The path from
+        -- startup may belong to KOReader's core input setup.
+        if self._input_opened_path and self._input_opened_path ~= path then
+            Device.input:close(self._input_opened_path)
+        end
+        Device.input:close(path)
+        Device.input:open(path)
+    end)
+    if not status then
+        return false, "Could not open input device " .. path .. ": " .. tostring(err)
+    end
+
+    self.input_device_path = path
+    self.input_path_is_known = is_known
+    self.input_path_method = method
+    self.input_path_extra = extra
+    self._input_opened_path = path
+
+    local msg = "Input device opened: " .. path
+    if method == "mtk_uhid_auto" then
+        msg = msg .. "\n(Detected Bluetooth HID device: " .. (extra or "unnamed") .. ")"
+    elseif method == "mtk_uhid_name_match" then
+        msg = msg .. "\n(Matched Bluetooth HID device: " .. (extra or "unnamed") .. ")"
+    elseif method == "mtk_uhid_highest" then
+        msg = msg .. "\n(Selected highest-numbered Bluetooth HID device)"
+    elseif method == "bt_name_match" then
+        msg = msg .. "\n(Matched by Bluetooth device name: " .. (extra or "?") .. ")"
+    elseif method == "device_model" then
+        msg = msg .. "\n(Known path for " .. (extra or Device.model) .. ")"
+    elseif method == "highest_event" then
+        msg = msg .. "\n(Best guess: highest event number)"
+    else
+        msg = msg .. "\n(Default fallback)"
+    end
+    return true, msg
+end
+
+function Bluetooth:refreshInputDeviceWhenAvailable(on_complete)
+    -- HID event nodes appear asynchronously after a successful Bluetooth
+    -- connection, so poll for the actual uhid device instead of guessing a
+    -- fixed delay.
+    if self._input_refresh_poll then
+        UIManager:unschedule(self._input_refresh_poll)
+        self._input_refresh_poll = nil
+    end
+
+    local attempts = 0
+    local max_attempts = 10
+    local function try_refresh()
+        local ok, success, detail = pcall(self.refreshInputDevice, self, true)
+        if not ok then
+            return false, "Input refresh failed: " .. tostring(success)
+        end
+        return success, detail
+    end
+    local function finish(success, detail)
+        self._input_refresh_poll = nil
+        if on_complete then
+            on_complete(success, detail)
+        elseif not success then
+            self:popup(_("Bluetooth connected, but its input device was not detected automatically.") ..
+                "\n\n" .. (detail or "Unknown error") .. "\n\n" ..
+                _("Use 'Refresh Device Input' to try again."), 10)
+        end
+    end
+
+    -- Try immediately in case the HID node already exists (for example after
+    -- connecting to a device that was connected before KOReader started).
+    attempts = attempts + 1
+    local success, detail = try_refresh()
+    if success then
+        finish(true, detail)
+        return
+    end
+
+    local poll
+    poll = function()
+        if self._input_refresh_poll ~= poll then
+            return
+        end
+
+        attempts = attempts + 1
+        local success, detail = try_refresh()
+        if success or attempts >= max_attempts then
+            finish(success, detail)
+            return
+        end
+
+        UIManager:scheduleIn(0.5, poll)
+    end
+
+    self._input_refresh_poll = poll
+    UIManager:scheduleIn(0.5, poll)
+end
+
 function Bluetooth:detectBluetoothBinaries()
     -- Check which Bluetooth binaries exist in /sbin
     local lfs = require("libs/libkoreader-lfs")
@@ -2736,16 +3162,32 @@ function Bluetooth:getDiagnosticsMenu()
         callback = function()
             -- Re-check when clicked
             local is_on = self:isBluetoothOn()
+            local power_state_error = self.mtk_dbus_last_error
             local status_info = ""
             
             if self:isMTKDevice() then
                 -- MTK: show D-Bus status
                 status_info = _("Device type: MTK (") .. self:getMTKDeviceName() .. ")\n"
                 status_info = status_info .. _("Control method: D-Bus (com.kobo.mtk.bluedroid)\n\n")
-                
-                -- Show D-Bus service status
-                local dbus_check = self:executeCommand("dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ListNames 2>&1 | grep -q 'com.kobo.mtk.bluedroid' && echo 'Service active' || echo 'Service not found'")
-                status_info = status_info .. _("D-Bus service: ") .. (dbus_check or "unknown") .. "\n"
+
+                if power_state_error then
+                    status_info = status_info .. _("Bluetooth power-state query failed:\n") .. power_state_error .. "\n\n"
+                end
+
+                -- Check whether the D-Bus service owns its well-known name.
+                local service_cmd = "dbus-send --system --print-reply --dest=org.freedesktop.DBus " ..
+                    "/org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner " ..
+                    "string:" .. self.mtk_dbus.dest
+                local service_ok, service_detail, service_output = self:executeDBusCommand(
+                    "Check ownership of D-Bus name " .. self.mtk_dbus.dest, service_cmd
+                )
+                if service_ok and service_output and service_output:match("boolean%s+true") then
+                    status_info = status_info .. _("D-Bus service: active\n")
+                elseif service_ok then
+                    status_info = status_info .. _("D-Bus service: not registered (NameHasOwner returned false)\n")
+                else
+                    status_info = status_info .. _("D-Bus service check failed:\n") .. service_detail .. "\n"
+                end
                 
                 -- Check mtkbtd/btservice processes
                 local processes = self:executeCommand("ps aux | grep -E '(mtkbtd|btservice)' | grep -v grep")
@@ -3059,15 +3501,10 @@ function Bluetooth:getDiagnosticsMenu()
                         },
                         {
                             {
-                                text = _("Advanced Default"),
+                                text = _("Choose Default Profile"),
                                 callback = function()
                                     UIManager:close(button_dialog)
-                                    local success, result = self:autoCorrectEventMap()
-                                    if success then
-                                        self:popup(_("✓ ") .. result, 7)
-                                    else
-                                        self:popup(_("✗ Auto-correction failed:\n") .. result, 7)
-                                    end
+                                    self:showDefaultMappingProfiles()
                                 end,
                             },
                         },
@@ -3625,9 +4062,18 @@ function Bluetooth:writeCustomEventMap(mappings)
     file:write("}\n")
     file:close()
     
-    -- Also inject into current session
+    -- Replace BT mappings in the current session as well
     local event_map = Device.input and Device.input.event_map
     if event_map then
+        local old_codes = {}
+        for code, name in pairs(event_map) do
+            if type(name) == "string" and name:match("^BT") then
+                table.insert(old_codes, code)
+            end
+        end
+        for _, code in ipairs(old_codes) do
+            event_map[code] = nil
+        end
         for code, name in pairs(mappings_to_write) do
             event_map[code] = name
         end
@@ -3661,31 +4107,43 @@ function Bluetooth:deleteEventMappings()
     return true
 end
 
-function Bluetooth:injectEventMappings()
-    -- Inject BTAction mappings into Device.input.event_map at runtime
+function Bluetooth:injectEventMappings(mappings)
+    -- Inject the selected mappings into Device.input.event_map at runtime
     local event_map = Device.input and Device.input.event_map
     if not event_map then
         return false, "event_map not accessible"
     end
-    
+
+    local mappings_to_inject = mappings or self.default_event_mappings
+    local old_codes = {}
+    for code, name in pairs(event_map) do
+        if type(name) == "string" and name:match("^BT") then
+            table.insert(old_codes, code)
+        end
+    end
+    for _, code in ipairs(old_codes) do
+        event_map[code] = nil
+    end
+
     local count = 0
-    for key, value in pairs(self.default_event_mappings) do
+    for key, value in pairs(mappings_to_inject) do
         event_map[key] = value
         count = count + 1
     end
-    
+
     return true, count
 end
 
-function Bluetooth:autoCorrectEventMap()
+function Bluetooth:autoCorrectEventMap(mappings)
     -- Step 1: Write the custom event_map.lua file (persists across restarts)
-    local write_ok, write_result = self:writeCustomEventMap()
+    local mappings_to_apply = mappings or self.default_event_mappings
+    local write_ok, write_result = self:writeCustomEventMap(mappings_to_apply)
     if not write_ok then
         return false, write_result
     end
     
     -- Step 2: Inject mappings into current session (immediate effect)
-    local inject_ok, inject_result = self:injectEventMappings()
+    local inject_ok, inject_result = self:injectEventMappings(mappings_to_apply)
     if not inject_ok then
         return true, "File written to " .. write_result .. " but runtime injection failed: " .. inject_result .. "\n\nPlease restart KOReader for changes to take effect."
     end
@@ -3810,8 +4268,14 @@ function Bluetooth:turnOnBluetoothCommands()
     -- Step 3: Attach HCI (device-specific command)
     table.insert(results, self:executeCommand(bt_config.hci_attach))
     
-    -- Step 4: Initialize D-Bus/BlueZ (silently - we don't need the verbose output)
-    os.execute("dbus-send --system --dest=org.bluez / org.freedesktop.DBus.ObjectManager.GetManagedObjects > /dev/null 2>&1")
+    -- Step 4: Initialize D-Bus/BlueZ and preserve any failure details
+    local dbus_ok, dbus_detail = self:executeDBusCommand(
+        "Call org.freedesktop.DBus.ObjectManager.GetManagedObjects on org.bluez",
+        "dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.ObjectManager.GetManagedObjects"
+    )
+    if not dbus_ok then
+        table.insert(results, dbus_detail)
+    end
     
     -- Step 5: Bring up HCI interface
     table.insert(results, self:executeCommand("hciconfig hci0 up"))
@@ -3830,6 +4294,12 @@ function Bluetooth:onBluetoothOn()
             config_note = _("\n(Auto-detected: ") .. (detection_info or "unknown") .. ")"
         elseif detection_type == "default" then
             config_note = _("\n(Using default config)")
+        end
+
+        -- A saved MTK remote may reconnect through Kobo's Bluetooth stack
+        -- without going through this plugin's connect action.
+        if self:isMTKDevice() and self:getSavedDeviceMAC() then
+            self:refreshInputDeviceWhenAvailable(function() end)
         end
         self:popup(_("Bluetooth turned on.") .. config_note)
     else
@@ -3852,17 +4322,20 @@ function Bluetooth:onBluetoothOn()
 end
 
 function Bluetooth:onBluetoothOff()
-    self:turnOffBluetooth()
-    self:popup(_("Bluetooth turned off."))
+    local success, detail = self:turnOffBluetooth()
+    if success then
+        self:popup(_("Bluetooth turned off."))
+    else
+        self:popup(_("Turning Bluetooth off failed:\n\n") .. (detail or "Unknown error"), 10)
+    end
 end
 
 function Bluetooth:turnOffBluetooth()
     -- Check if we're on an MTK device - use D-Bus instead
     if self:isMTKDevice() then
-        self:turnOffMTKBluetooth()
         -- Note: MTK devices may need a reboot before returning to Nickel
         -- due to non-idempotent kernel driver initialization
-        return
+        return self:turnOffMTKBluetooth()
     end
     
     -- i.MX6 devices: use traditional method
@@ -3890,6 +4363,7 @@ function Bluetooth:turnOffBluetooth()
     -- Step 5: Unload UHID module
     self:executeCommand("rmmod uhid")
     -- Note: is_bluetooth_on cache will be updated on next isBluetoothOn() call
+    return true, "Bluetooth turned off"
 end
 
 function Bluetooth:onRefreshPairing()
@@ -3898,35 +4372,11 @@ function Bluetooth:onRefreshPairing()
         return
     end
 
-    -- Dynamically update input device path (try to match by BT device name first)
-    local path, is_known, method, extra = self:updateInputDevicePath()
-
-    local status, err = pcall(function()
-        -- Ensure the device path is valid
-        if not path or path == "" then
-            error("Invalid device path")
-        end
-
-        Device.input:close(path) -- Close the input using the high-level parameter
-        Device.input:open(path)  -- Reopen the input using the high-level parameter
-        
-        -- Build informative message
-        local msg = _("Input device opened: ") .. path
-        if method == "bt_name_match" then
-            msg = msg .. "\n" .. _("(Matched by Bluetooth device name: ") .. (extra or "?") .. ")"
-        elseif method == "device_model" then
-            msg = msg .. "\n" .. _("(Known path for ") .. (extra or Device.model) .. ")"
-        elseif method == "highest_event" then
-            msg = msg .. "\n" .. _("(Best guess: highest event number)")
-        else
-            msg = msg .. "\n" .. _("(Default fallback)")
-        end
-        
-        self:popup(msg, 4)
-    end)
-
-    if not status then
-        self:popup(_("Error: ") .. err)
+    local success, detail = self:refreshInputDevice(false)
+    if success then
+        self:popup(detail, 4)
+    else
+        self:popup(_("Error refreshing input: ") .. detail, 5)
     end
 end
 
@@ -4133,18 +4583,15 @@ function Bluetooth:onFullBluetoothSetup()
                     UIManager:scheduleIn(1, function()
                         self:popup(connect_success and _("✓ Device connected") or _("⚠ Connection may have failed"), 2)
                         
-                        -- Step 4: Refresh device input
+                        -- Step 4: Wait for the kernel HID device and refresh input
                         UIManager:scheduleIn(1, function()
                             self:popup(_("Step 4: Refreshing device input..."), 4)
-                            local status, err = pcall(function()
-                                if not self.input_device_path or self.input_device_path == "" then
-                                    error("Invalid device path")
+                            self:refreshInputDeviceWhenAvailable(function(input_success, input_detail)
+                                if not input_success then
+                                    self:popup(_("Error refreshing input: ") .. (input_detail or "Unknown error"), 8)
+                                    return
                                 end
-                                Device.input:close(self.input_device_path)
-                                Device.input:open(self.input_device_path)
-                            end)
-                            
-                            if status then
+
                                 UIManager:scheduleIn(1, function()
                                     self:popup(_("✓ Device input refreshed"), 2)
                                     
@@ -4166,9 +4613,7 @@ function Bluetooth:onFullBluetoothSetup()
                                         end
                                     end)
                                 end)
-                            else
-                                self:popup(_("Error refreshing input: ") .. err, 4)
-                            end
+                            end)
                         end)
                     end)
                 end)
